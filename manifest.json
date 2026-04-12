@@ -1,0 +1,49 @@
+{
+  "id": "cloud-backup",
+  "name": "Cloud Backup",
+  "version": "1.1.0",
+  "description": "Automatic background sync of .authbook files to Google Drive, OneDrive, Dropbox, or WebDAV.",
+  "author": "Aurora Studios",
+  "icon": "\u2601\ufe0f",
+  "minAppVersion": "1.1.14-beta.7",
+  "pro": true,
+  "contributes": {
+    "homescreen": [
+      {
+        "id": "sync-status-tile",
+        "label": "Cloud Backup",
+        "page": "settings"
+      }
+    ],
+    "settings": [
+      {
+        "id": "cloud-backup-settings",
+        "label": "Cloud Backup",
+        "icon": "Cloud",
+        "page": "settings"
+      }
+    ],
+    "bookDashboard": {
+      "actions": [
+        {
+          "id": "backup-now",
+          "label": "Back up now",
+          "icon": "Upload",
+          "page": "settings"
+        }
+      ]
+    },
+    "pages": {
+      "settings": {
+        "title": "Cloud Backup",
+        "type": "ui-file",
+        "file": "Settings.js"
+      },
+      "conflict": {
+        "title": "Sync Conflict",
+        "type": "ui-file",
+        "file": "ConflictResolution.js"
+      }
+    }
+  }
+}
