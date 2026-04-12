@@ -1,16 +1,16 @@
 /**
- * providers/gdrive.js — Google Drive provider (OAuth2 PKCE)
+ * providers/gdrive.js — v1.2.0
  *
- * Saves files inside a user-visible folder named "AuthNo" at the root of
- * the user's Drive (creates it on first use if absent).
- *
- * Scopes required:
- *   https://www.googleapis.com/auth/drive.file
- *
- * TODO before shipping:
- *   - Register OAuth client ID in Google Cloud Console
- *   - Set redirect URI to:  com.aurorastudios.authno:/oauth2/gdrive
- *   - Add intent-filter in AndroidManifest.xml for the redirect scheme
+ * Changes from v1.1.0:
+ *   - connect(): replaced App.addListener('appUrlOpen') with
+ *     window.addEventListener('__capacitor_app_url_open'). MainActivity.java
+ *     dispatches a DOM CustomEvent on that name; Capacitor's App plugin bus
+ *     is a completely separate channel and never received the redirect.
+ *     This was the primary reason Google Drive OAuth always hung forever.
+ *   - _refreshIfNeeded(): unchanged — token refresh logic is correct.
+ *   - upload()/download(): callers now use provider.refreshCreds(storage)
+ *     before calling, so these methods receive already-fresh creds and the
+ *     internal _refreshIfNeeded() call is a fast no-op.
  */
 
 import { BaseProvider } from './base.js';
@@ -22,18 +22,16 @@ const TOKEN_URL    = 'https://oauth2.googleapis.com/token';
 const API_BASE     = 'https://www.googleapis.com';
 const FOLDER_NAME  = 'AuthNo';
 
-// ── PKCE helpers ─────────────────────────────────────────────────────────────
-
 function randomBase64url(len) {
   const arr = new Uint8Array(len);
   crypto.getRandomValues(arr);
-  return btoa(String.fromCharCode(...arr)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+  return btoa(String.fromCharCode(...arr)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
 }
 
 async function sha256Base64url(str) {
   const enc  = new TextEncoder().encode(str);
   const hash = await crypto.subtle.digest('SHA-256', enc);
-  return btoa(String.fromCharCode(...new Uint8Array(hash))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+  return btoa(String.fromCharCode(...new Uint8Array(hash))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
 }
 
 function remoteFileName(sessionId) {
@@ -46,9 +44,9 @@ export class GDriveProvider extends BaseProvider {
   get icon() { return 'HardDrive'; }
 
   async connect(_config) {
-    const verifier   = randomBase64url(64);
-    const challenge  = await sha256Base64url(verifier);
-    const state      = randomBase64url(16);
+    const verifier  = randomBase64url(64);
+    const challenge = await sha256Base64url(verifier);
+    const state     = randomBase64url(16);
 
     const params = new URLSearchParams({
       client_id:             CLIENT_ID,
@@ -65,30 +63,41 @@ export class GDriveProvider extends BaseProvider {
     const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
 
     const { Browser } = await import('@capacitor/browser');
+
     let resolveCode, rejectCode;
     const codePromise = new Promise((res, rej) => { resolveCode = res; rejectCode = rej; });
 
+    // ── FIX: listen on the DOM CustomEvent dispatched by MainActivity ─────
+    // Previously used App.addListener('appUrlOpen') which is the Capacitor
+    // native plugin bus — a completely different channel. MainActivity fires
+    // window.dispatchEvent(new CustomEvent('__capacitor_app_url_open', ...))
+    // so we must listen here, not on the Capacitor App plugin.
     const handler = (event) => {
-      const url = new URL(event.detail?.url ?? '');
-      if (!url.href.startsWith(REDIRECT_URI)) return;
-      Browser.removeAllListeners();
-      Browser.close();
+      const urlStr = event.detail?.url ?? '';
+      if (!urlStr.startsWith(REDIRECT_URI)) return;
+
+      window.removeEventListener('__capacitor_app_url_open', handler);
+      Browser.close().catch(() => {});
+
+      const url      = new URL(urlStr);
       const code     = url.searchParams.get('code');
       const gotState = url.searchParams.get('state');
+
       if (gotState !== state) { rejectCode(new Error('State mismatch')); return; }
-      if (!code)              { rejectCode(new Error('No auth code')); return; }
+      if (!code)              { rejectCode(new Error('No auth code'));    return; }
       resolveCode(code);
     };
 
-    const { App } = await import('@capacitor/app');
-    const listener = await App.addListener('appUrlOpen', handler);
+    window.addEventListener('__capacitor_app_url_open', handler);
 
     await Browser.open({ url: authUrl });
+
     let code;
     try {
       code = await codePromise;
-    } finally {
-      listener.remove();
+    } catch (err) {
+      window.removeEventListener('__capacitor_app_url_open', handler);
+      throw err;
     }
 
     const tokenRes = await fetch(TOKEN_URL, {
@@ -149,9 +158,6 @@ export class GDriveProvider extends BaseProvider {
     } catch { return false; }
   }
 
-  /**
-   * Finds (or creates) the "AuthNo" folder in the user's Drive root.
-   */
   async _getOrCreateFolder(auth) {
     const q = encodeURIComponent(
       `name='${FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false`
@@ -164,27 +170,22 @@ export class GDriveProvider extends BaseProvider {
     const { files } = await searchRes.json();
     if (files?.length) return files[0].id;
 
-    // Create the AuthNo folder
     const createRes = await fetch(`${API_BASE}/drive/v3/files`, {
       method: 'POST',
       headers: { Authorization: auth, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name:     FOLDER_NAME,
-        mimeType: 'application/vnd.google-apps.folder',
-      }),
+      body: JSON.stringify({ name: FOLDER_NAME, mimeType: 'application/vnd.google-apps.folder' }),
     });
     if (!createRes.ok) throw new Error(`Folder creation failed: ${createRes.status}`);
-    const folder = await createRes.json();
-    return folder.id;
+    return (await createRes.json()).id;
   }
 
   async upload(entry, creds, base64) {
+    // Callers use provider.refreshCreds(storage) before upload; this is a fast no-op.
     creds = await this._refreshIfNeeded(creds);
     const auth     = `Bearer ${creds.accessToken}`;
     const fname    = remoteFileName(entry.sessionId);
     const folderId = await this._getOrCreateFolder(auth);
 
-    // Find existing file inside AuthNo folder
     const q = encodeURIComponent(
       `name='${fname}' and '${folderId}' in parents and trashed=false`
     );
@@ -196,7 +197,6 @@ export class GDriveProvider extends BaseProvider {
     const { files } = await searchRes.json();
     const existing = files?.[0];
 
-    // Conflict check
     if (existing) {
       const remoteTime   = new Date(existing.modifiedTime).getTime();
       const lastUploaded = entry.lastUploadedAt ? new Date(entry.lastUploadedAt).getTime() : 0;
@@ -205,7 +205,6 @@ export class GDriveProvider extends BaseProvider {
       }
     }
 
-    // Upload (multipart)
     const bytes    = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
     const boundary = 'authno_boundary_xk8';
     const meta     = JSON.stringify(
@@ -216,13 +215,12 @@ export class GDriveProvider extends BaseProvider {
     const part2   = new TextEncoder().encode(`--${boundary}\r\nContent-Type: application/octet-stream\r\n\r\n`);
     const endPart = new TextEncoder().encode(`\r\n--${boundary}--`);
 
-    const totalLen = part1.length + part2.length + bytes.length + endPart.length;
-    const merged   = new Uint8Array(totalLen);
-    let offset = 0;
-    merged.set(part1,   offset); offset += part1.length;
-    merged.set(part2,   offset); offset += part2.length;
-    merged.set(bytes,   offset); offset += bytes.length;
-    merged.set(endPart, offset);
+    const merged = new Uint8Array(part1.length + part2.length + bytes.length + endPart.length);
+    let off = 0;
+    merged.set(part1,   off); off += part1.length;
+    merged.set(part2,   off); off += part2.length;
+    merged.set(bytes,   off); off += bytes.length;
+    merged.set(endPart, off);
 
     const uploadUrl = existing
       ? `${API_BASE}/upload/drive/v3/files/${existing.id}?uploadType=multipart`
@@ -230,10 +228,7 @@ export class GDriveProvider extends BaseProvider {
 
     const uploadRes = await fetch(uploadUrl, {
       method:  existing ? 'PATCH' : 'POST',
-      headers: {
-        Authorization:  auth,
-        'Content-Type': `multipart/related; boundary=${boundary}`,
-      },
+      headers: { Authorization: auth, 'Content-Type': `multipart/related; boundary=${boundary}` },
       body: merged,
     });
 

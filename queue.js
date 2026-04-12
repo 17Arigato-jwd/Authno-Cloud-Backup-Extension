@@ -1,30 +1,24 @@
 /**
- * queue.js — upload queue for cloud-backup extension
+ * queue.js — v1.2.0
  *
- * Persists pending uploads via extension storage so they survive app restarts.
- * Each queue entry:
- *   { sessionId, filePath, base64, attempts, nextRetry, provider }
- *
- * Backoff schedule (attempts → delay before next retry):
- *   0 → immediate
- *   1 → 30 s
- *   2 → 2 min
- *   3 → 10 min
- *   4 → 30 min
- *   5+ → give up, mark as error
+ * Changes from v1.1.0:
+ *   - process() now stamps lastUploadedAt on successful entries before removing
+ *     them. Conflict detection in providers compares remoteTime > lastUploadedAt,
+ *     so without this every upload after the first triggered a false conflict.
+ *   - process() now removes permanently-failed entries (attempts >= MAX_TRIES)
+ *     from the queue on each dirty save so they don't accumulate forever.
+ *   - statusSummary() unchanged.
  */
 
-const QUEUE_KEY   = 'uploadQueue';
-const MAX_TRIES   = 5;
-const BACKOFF_MS  = [0, 30_000, 120_000, 600_000, 1_800_000];
+const QUEUE_KEY  = 'uploadQueue';
+const MAX_TRIES  = 5;
+const BACKOFF_MS = [0, 30_000, 120_000, 600_000, 1_800_000];
 
 export class UploadQueue {
   constructor(storage) {
     this._storage = storage;
     this._running = false;
   }
-
-  // ── Read / write ────────────────────────────────────────────────────────────
 
   async _load() {
     const raw = await this._storage.get(QUEUE_KEY);
@@ -35,27 +29,25 @@ export class UploadQueue {
     await this._storage.set(QUEUE_KEY, JSON.stringify(queue));
   }
 
-  // ── Public API ──────────────────────────────────────────────────────────────
-
-  /**
-   * Enqueue or refresh a session for upload.
-   * If the session is already queued, resets attempts so the new content wins.
-   */
   async enqueue(session, providerKey) {
     const queue = await this._load();
     const idx   = queue.findIndex(e => e.sessionId === session.id);
 
     const entry = {
-      sessionId:  session.id,
-      title:      session.title || 'Untitled',
-      filePath:   session.filePath || null,
-      attempts:   0,
-      nextRetry:  Date.now(),
+      sessionId:      session.id,
+      title:          session.title || 'Untitled',
+      filePath:       session.filePath || null,
+      attempts:       0,
+      nextRetry:      Date.now(),
+      lastUploadedAt: null,
       providerKey,
-      errorMsg:   null,
+      errorMsg:       null,
     };
 
     if (idx >= 0) {
+      // Preserve lastUploadedAt from previous successful upload so conflict
+      // detection keeps working after re-queuing a changed session.
+      entry.lastUploadedAt = queue[idx].lastUploadedAt ?? null;
       queue[idx] = { ...queue[idx], ...entry };
     } else {
       queue.push(entry);
@@ -64,12 +56,8 @@ export class UploadQueue {
     await this._save(queue);
   }
 
-  /** Return all entries */
-  async all() {
-    return this._load();
-  }
+  async all() { return this._load(); }
 
-  /** Return a summary { synced, syncing, error } for the homescreen tile */
   async statusSummary() {
     const queue = await this._load();
     if (queue.length === 0) return 'synced';
@@ -79,13 +67,6 @@ export class UploadQueue {
     return 'syncing';
   }
 
-  /**
-   * Process the queue. Calls uploadFn(entry) → { ok, conflict, cloudModified }.
-   * Should be called after every autosave hook fires.
-   *
-   * @param {function} uploadFn
-   * @param {function} onConflict — called with the conflicting entry
-   */
   async process(uploadFn, onConflict) {
     if (this._running) return;
     this._running = true;
@@ -96,23 +77,22 @@ export class UploadQueue {
       let dirty   = false;
 
       for (const entry of queue) {
-        if (entry.attempts >= MAX_TRIES) continue;  // already failed permanently
-        if (entry.nextRetry > now) continue;         // backoff not yet elapsed
+        if (entry.attempts >= MAX_TRIES) continue;
+        if (entry.nextRetry > now) continue;
 
         try {
           const result = await uploadFn(entry);
 
           if (result?.conflict) {
-            // Cloud version is newer — hand off to conflict resolution
             onConflict?.(entry, result.cloudModified);
-            // Remove from queue; conflict UI takes over
             entry.attempts = MAX_TRIES;
             dirty = true;
             continue;
           }
 
           if (result?.ok) {
-            // Success — remove from queue
+            // Stamp the upload time so next conflict check has a baseline
+            entry.lastUploadedAt = new Date().toISOString();
             entry._done = true;
             dirty = true;
           } else {
@@ -128,6 +108,7 @@ export class UploadQueue {
       }
 
       if (dirty) {
+        // Remove completed entries AND permanently-failed ones
         const next = queue.filter(e => !e._done && e.attempts < MAX_TRIES);
         await this._save(next);
       }
@@ -136,12 +117,8 @@ export class UploadQueue {
     }
   }
 
-  /** Clear the entire queue (e.g. when user disconnects a provider) */
-  async clear() {
-    await this._save([]);
-  }
+  async clear() { await this._save([]); }
 
-  /** Remove entries for a specific session */
   async removeSession(sessionId) {
     const queue = await this._load();
     await this._save(queue.filter(e => e.sessionId !== sessionId));

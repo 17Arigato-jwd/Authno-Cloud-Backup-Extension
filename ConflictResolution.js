@@ -1,20 +1,25 @@
 /**
- * ui/ConflictResolution.js — Conflict resolution page
+ * ui/ConflictResolution.js — v1.2.0
  *
- * Shown when the cloud has a newer version of a book than the local copy.
- * The session data is passed via window.CloudBackupAPI.conflictContext.
- *
- * Options:
- *   Keep local  → force-upload the local copy (overwrites cloud)
- *   Use cloud   → download the cloud copy and replace the local session
+ * Changes from v1.1.0:
+ *   - Reads conflict context from extension storage via the API bridge
+ *     (storage.get('conflictContext')) instead of API.conflictContext which
+ *     was never populated. index.js now writes the context to storage before
+ *     calling navigate(), so it's always available when this page loads.
+ *   - Replaced window.history.back() with window.parent.postMessage({ type:
+ *     'ext-close' }) because history.back() inside a sandboxed iframe only
+ *     affects the iframe's own history stack (length 1) and never navigates
+ *     the app back to the previous view.
+ *   - getAPI() waits for CloudBackupAPI synchronously (it's injected by the
+ *     bridge shim before this script runs) with a short polling fallback.
  */
 
 document.head.insertAdjacentHTML('beforeend', `<style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-    font-size:14px;color:#e4e4f0;background:#16161d;padding:20px}
+    font-size:14px;color:#e4e4f0;background:transparent;padding:20px}
   h1{font-size:18px;font-weight:600;margin-bottom:4px}
-  .sub{color:#6b6b80;font-size:13px;margin-bottom:24px}
+  .sub{color:#6b6b80;font-size:13px;margin-bottom:24px;line-height:1.5}
   .card{background:#1f1f2a;border:1px solid #2e2e3a;border-radius:12px;padding:16px;margin-bottom:12px}
   .card h2{font-size:13px;font-weight:600;color:#6b6b80;text-transform:uppercase;
     letter-spacing:.05em;margin-bottom:8px}
@@ -29,23 +34,47 @@ document.head.insertAdjacentHTML('beforeend', `<style>
     justify-content:center;margin-bottom:8px}
   .btn-local{background:#6366f1;color:#fff}
   .btn-cloud{background:#22c55e;color:#000}
+  .btn:disabled{opacity:0.5;cursor:not-allowed}
   .note{color:#6b6b80;font-size:12px;margin-top:16px;line-height:1.6}
+  .err{color:#ef4444;font-size:12px;margin-top:8px}
 </style>`);
 
-async function init() {
-  // Wait for host to inject API
-  let API;
-  await new Promise(res => {
-    if (window.CloudBackupAPI) { API = window.CloudBackupAPI; res(); return; }
-    const t = setInterval(() => {
-      if (window.CloudBackupAPI) { clearInterval(t); API = window.CloudBackupAPI; res(); }
-    }, 100);
-  });
+function getAPI() {
+  return window.CloudBackupAPI ?? null;
+}
 
-  const ctx = API.conflictContext ?? {};
+function closePage() {
+  // Signal ExtensionPage.jsx to call onBack() — history.back() is a no-op in iframes
+  window.parent.postMessage({ type: 'ext-close' }, '*');
+}
+
+async function init() {
+  // Bridge shim is injected synchronously before this script; tiny poll as safety net
+  let API = getAPI();
+  if (!API) {
+    await new Promise(res => {
+      const t = setInterval(() => {
+        if (window.CloudBackupAPI) { clearInterval(t); API = window.CloudBackupAPI; res(); }
+      }, 50);
+      setTimeout(() => { clearInterval(t); res(); }, 3000);
+    });
+  }
+
+  if (!API) {
+    document.body.innerHTML = `<div style="padding:20px;color:#ef4444">Extension API not available.</div>`;
+    return;
+  }
+
+  // Read conflict context from extension storage (written by index.js before navigate)
+  let ctx = {};
+  try {
+    const raw = await API.storage.get('conflictContext');
+    if (raw) ctx = JSON.parse(raw);
+  } catch (_) {}
+
   const { sessionId, title, cloudModified, providerName } = ctx;
 
-  const localDate = new Date().toLocaleString();   // approximate — local is "just now"
+  const localDate = new Date().toLocaleString();
   const cloudDate = cloudModified ? new Date(cloudModified).toLocaleString() : 'Unknown';
 
   document.body.innerHTML = `
@@ -71,6 +100,7 @@ async function init() {
 
     <button class="btn btn-local" id="btn-keep-local">Keep local copy</button>
     <button class="btn btn-cloud" id="btn-use-cloud">Use cloud version</button>
+    <div class="err" id="err-msg"></div>
 
     <p class="note">
       "Keep local" will overwrite the cloud version with your current edits.<br>
@@ -80,8 +110,13 @@ async function init() {
   `;
 
   document.getElementById('btn-keep-local').addEventListener('click', async () => {
-    await API.resolveConflict(sessionId, 'keep-local');
-    window.history.back();
+    try {
+      await API.resolveConflict(sessionId, 'keep-local');
+      await API.storage.set('conflictContext', null);
+      closePage();
+    } catch (e) {
+      document.getElementById('err-msg').textContent = e.message;
+    }
   });
 
   document.getElementById('btn-use-cloud').addEventListener('click', async () => {
@@ -90,9 +125,11 @@ async function init() {
     btn.disabled = true;
     try {
       await API.resolveConflict(sessionId, 'use-cloud');
-      window.history.back();
+      await API.storage.set('conflictContext', null);
+      closePage();
     } catch (e) {
-      btn.textContent = `Failed: ${e.message}`;
+      document.getElementById('err-msg').textContent = e.message;
+      btn.textContent = 'Use cloud version';
       btn.disabled = false;
     }
   });

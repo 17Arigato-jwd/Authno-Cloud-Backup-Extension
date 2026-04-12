@@ -1,31 +1,26 @@
 /**
- * providers/dropbox_onedrive.js
+ * providers/dropbox_onedrive.js — v1.2.0
  *
- * Dropbox  — OAuth2 PKCE, files stored at /AuthNo/<sessionId>.authbook
- * OneDrive — OAuth2 PKCE (Microsoft Identity Platform), files stored in
- *            the app's special "approot" folder under AuthNo/
- *
- * TODO before shipping:
- *   Dropbox:  Register app in Dropbox App Console → redirect URI:
- *             com.aurorastudios.authno:/oauth2/dropbox
- *   OneDrive: Register app in Azure AD (consumers tenant) → redirect URI:
- *             com.aurorastudios.authno:/oauth2/onedrive
+ * Changes from v1.1.0:
+ *   - pkceOAuthFlow(): replaced App.addListener('appUrlOpen') with
+ *     window.addEventListener('__capacitor_app_url_open'). Same fix as
+ *     gdrive.js — Capacitor plugin bus vs DOM CustomEvent mismatch.
+ *   - Dropbox/OneDrive placeholder client IDs left unchanged pending
+ *     registration in their respective developer consoles.
  */
 
 import { BaseProvider } from './base.js';
 
-// ── Shared PKCE helpers ───────────────────────────────────────────────────────
-
 function randomBase64url(len) {
   const arr = new Uint8Array(len);
   crypto.getRandomValues(arr);
-  return btoa(String.fromCharCode(...arr)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+  return btoa(String.fromCharCode(...arr)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
 }
 
 async function sha256Base64url(str) {
   const enc  = new TextEncoder().encode(str);
   const hash = await crypto.subtle.digest('SHA-256', enc);
-  return btoa(String.fromCharCode(...new Uint8Array(hash))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+  return btoa(String.fromCharCode(...new Uint8Array(hash))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
 }
 
 async function pkceOAuthFlow({ authUrl, tokenUrl, clientId, redirectUri, extraTokenParams = {} }) {
@@ -40,30 +35,36 @@ async function pkceOAuthFlow({ authUrl, tokenUrl, clientId, redirectUri, extraTo
   });
 
   const { Browser } = await import('@capacitor/browser');
+
   let resolveCode, rejectCode;
   const codePromise = new Promise((res, rej) => { resolveCode = res; rejectCode = rej; });
 
+  // ── FIX: DOM CustomEvent, not Capacitor App plugin bus ───────────────────
   const handler = (event) => {
-    const url = new URL(event.detail?.url ?? '');
-    if (!url.href.startsWith(redirectUri)) return;
-    Browser.removeAllListeners();
-    Browser.close();
+    const urlStr = event.detail?.url ?? '';
+    if (!urlStr.startsWith(redirectUri)) return;
+
+    window.removeEventListener('__capacitor_app_url_open', handler);
+    Browser.close().catch(() => {});
+
+    const url      = new URL(urlStr);
     const code     = url.searchParams.get('code');
     const gotState = url.searchParams.get('state');
+
     if (gotState !== state) { rejectCode(new Error('State mismatch')); return; }
-    if (!code)              { rejectCode(new Error('No auth code')); return; }
+    if (!code)              { rejectCode(new Error('No auth code'));    return; }
     resolveCode(code);
   };
 
-  const { App } = await import('@capacitor/app');
-  const listener = await App.addListener('appUrlOpen', handler);
+  window.addEventListener('__capacitor_app_url_open', handler);
   await Browser.open({ url: fullAuthUrl });
 
   let code;
   try {
     code = await codePromise;
-  } finally {
-    listener.remove();
+  } catch (err) {
+    window.removeEventListener('__capacitor_app_url_open', handler);
+    throw err;
   }
 
   const tokenRes = await fetch(tokenUrl, {
@@ -88,9 +89,7 @@ async function pkceOAuthFlow({ authUrl, tokenUrl, clientId, redirectUri, extraTo
   };
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-// DROPBOX
-// ═════════════════════════════════════════════════════════════════════════════
+// ── DROPBOX ───────────────────────────────────────────────────────────────────
 
 const DROPBOX_CLIENT_ID    = '__DROPBOX_CLIENT_ID__';
 const DROPBOX_REDIRECT_URI = 'com.aurorastudios.authno:/oauth2/dropbox';
@@ -104,10 +103,10 @@ export class DropboxProvider extends BaseProvider {
   async connect(_config) {
     return pkceOAuthFlow({
       authUrl: 'https://www.dropbox.com/oauth2/authorize?' + new URLSearchParams({
-        client_id:          DROPBOX_CLIENT_ID,
-        redirect_uri:       DROPBOX_REDIRECT_URI,
-        response_type:      'code',
-        token_access_type:  'offline',
+        client_id:         DROPBOX_CLIENT_ID,
+        redirect_uri:      DROPBOX_REDIRECT_URI,
+        response_type:     'code',
+        token_access_type: 'offline',
       }),
       tokenUrl:    'https://api.dropboxapi.com/oauth2/token',
       clientId:    DROPBOX_CLIENT_ID,
@@ -145,40 +144,34 @@ export class DropboxProvider extends BaseProvider {
     } catch { return false; }
   }
 
-  _remotePath(sessionId) {
-    return `${DROPBOX_REMOTE_ROOT}/${sessionId}.authbook`;
-  }
+  _remotePath(sessionId) { return `${DROPBOX_REMOTE_ROOT}/${sessionId}.authbook`; }
 
   async upload(entry, creds, base64) {
     creds = await this._refreshIfNeeded(creds);
     const path  = this._remotePath(entry.sessionId);
     const bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
 
-    // Check remote metadata for conflict detection
     try {
       const metaRes = await fetch('https://api.dropboxapi.com/2/files/get_metadata', {
         method: 'POST',
-        headers: {
-          Authorization: `Bearer ${creds.accessToken}`,
-          'Content-Type': 'application/json',
-        },
+        headers: { Authorization: `Bearer ${creds.accessToken}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ path }),
       });
       if (metaRes.ok) {
-        const meta = await metaRes.json();
+        const meta         = await metaRes.json();
         const remoteTime   = new Date(meta.server_modified).getTime();
         const lastUploaded = entry.lastUploadedAt ? new Date(entry.lastUploadedAt).getTime() : 0;
         if (remoteTime > lastUploaded + 5000) {
           return { ok: false, conflict: true, cloudModified: meta.server_modified };
         }
       }
-    } catch { /* file doesn't exist yet — that's fine */ }
+    } catch { /* file doesn't exist yet */ }
 
     const uploadRes = await fetch('https://content.dropboxapi.com/2/files/upload', {
       method: 'POST',
       headers: {
-        Authorization:    `Bearer ${creds.accessToken}`,
-        'Content-Type':   'application/octet-stream',
+        Authorization:     `Bearer ${creds.accessToken}`,
+        'Content-Type':    'application/octet-stream',
         'Dropbox-API-Arg': JSON.stringify({ path, mode: 'overwrite', autorename: false }),
       },
       body: bytes,
@@ -195,7 +188,7 @@ export class DropboxProvider extends BaseProvider {
     const res = await fetch('https://content.dropboxapi.com/2/files/download', {
       method: 'POST',
       headers: {
-        Authorization:    `Bearer ${creds.accessToken}`,
+        Authorization:     `Bearer ${creds.accessToken}`,
         'Dropbox-API-Arg': JSON.stringify({ path }),
       },
     });
@@ -204,19 +197,17 @@ export class DropboxProvider extends BaseProvider {
     const metaHeader = res.headers.get('dropbox-api-result');
     const meta       = metaHeader ? JSON.parse(metaHeader) : {};
     const buf        = await res.arrayBuffer();
-    const base64     = btoa(String.fromCharCode(...new Uint8Array(buf)));
-    return { base64, modifiedAt: meta.server_modified ?? new Date().toISOString() };
+    const b64        = btoa(String.fromCharCode(...new Uint8Array(buf)));
+    return { base64: b64, modifiedAt: meta.server_modified ?? new Date().toISOString() };
   }
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-// ONEDRIVE (Microsoft Graph, PKCE)
-// ═════════════════════════════════════════════════════════════════════════════
+// ── ONEDRIVE ──────────────────────────────────────────────────────────────────
 
 const OD_CLIENT_ID    = '__ONEDRIVE_CLIENT_ID__';
 const OD_REDIRECT_URI = 'com.aurorastudios.authno:/oauth2/onedrive';
 const OD_TOKEN_URL    = 'https://login.microsoftonline.com/consumers/oauth2/v2.0/token';
-const OD_FOLDER       = 'AuthNo';   // subfolder inside the app's special approot
+const OD_FOLDER       = 'AuthNo';
 
 export class OneDriveProvider extends BaseProvider {
   constructor() { super('onedrive'); }
@@ -266,7 +257,6 @@ export class OneDriveProvider extends BaseProvider {
     } catch { return false; }
   }
 
-  // Files go to: special/approot:/AuthNo/<sessionId>.authbook
   _itemPath(sessionId) {
     return `https://graph.microsoft.com/v1.0/me/drive/special/approot:/${OD_FOLDER}/${sessionId}.authbook`;
   }
@@ -277,11 +267,10 @@ export class OneDriveProvider extends BaseProvider {
     const path  = this._itemPath(entry.sessionId);
     const bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
 
-    // Conflict check: fetch remote metadata
     try {
       const metaRes = await fetch(`${path}:/`, { headers: { Authorization: auth } });
       if (metaRes.ok) {
-        const meta = await metaRes.json();
+        const meta         = await metaRes.json();
         const remoteTime   = new Date(meta.lastModifiedDateTime).getTime();
         const lastUploaded = entry.lastUploadedAt ? new Date(entry.lastUploadedAt).getTime() : 0;
         if (remoteTime > lastUploaded + 5000) {
