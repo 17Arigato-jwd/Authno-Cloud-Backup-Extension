@@ -103,7 +103,9 @@ export class UploadQueue {
           entry.errorMsg  = err.message;
           entry.nextRetry = Date.now() + (BACKOFF_MS[entry.attempts] ?? BACKOFF_MS.at(-1));
           dirty = true;
-          console.warn(`[cloud-backup] upload failed (attempt ${entry.attempts}/${MAX_TRIES}):`, err.message);
+          // All upload errors surface here — visible in Android WebView DevTools
+          // and in Authno's built-in error log (Settings → Data Management → Error Log)
+          console.error(`[cloud-backup] UPLOAD FAILED [${entry.title}] attempt ${entry.attempts}/${MAX_TRIES}:`, err.message, err.stack ?? '');
         }
       }
 
@@ -115,6 +117,29 @@ export class UploadQueue {
     } finally {
       this._running = false;
     }
+  }
+
+  /**
+   * Reset all permanently-failed entries (attempts >= MAX_TRIES) back to 0
+   * so they get retried. Called on activate() so failed books don't stay
+   * stuck forever — they get one fresh attempt on every app start.
+   */
+  async resetFailed() {
+    const queue = await this._load();
+    let changed = false;
+    for (const entry of queue) {
+      if (entry.attempts >= MAX_TRIES) {
+        entry.attempts  = 0;
+        entry.nextRetry = Date.now();
+        entry.errorMsg  = null;
+        changed = true;
+      }
+    }
+    if (changed) {
+      await this._save(queue);
+      console.log(`[cloud-backup] resetFailed: ${queue.filter(e => !e.attempts).length} entries reset`);
+    }
+    return changed;
   }
 
   async clear() { await this._save([]); }

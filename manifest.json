@@ -1,12 +1,11 @@
 {
   "id": "cloud-backup",
   "name": "Cloud Backup",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Automatic background sync of .authbook files to Google Drive, OneDrive, Dropbox, or WebDAV.",
   "author": "Aurora Studios",
-  "icon": "\u2601\ufe0f",
-  "minAppVersion": "1.1.14-beta.7",
-  "pro": true,
+  "icon": "Cloud",
+  "minAppVersion": "1.1.14-beta.10",
   "contributes": {
     "homescreen": [
       {
@@ -45,5 +44,6 @@
         "file": "ConflictResolution.js"
       }
     }
-  }
+  },
+  "tier": "premium"
 }

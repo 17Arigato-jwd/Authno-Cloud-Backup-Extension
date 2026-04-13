@@ -34,18 +34,19 @@ async function pkceOAuthFlow({ authUrl, tokenUrl, clientId, redirectUri, extraTo
     state,
   });
 
-  const { Browser } = await import('@capacitor/browser');
+  // @capacitor/browser cannot be bare-imported in a sandboxed srcdoc iframe.
+  const API = window.CloudBackupAPI;
+  if (!API?.openBrowser) throw new Error('CloudBackupAPI.openBrowser not available');
 
   let resolveCode, rejectCode;
   const codePromise = new Promise((res, rej) => { resolveCode = res; rejectCode = rej; });
 
-  // ── FIX: DOM CustomEvent, not Capacitor App plugin bus ───────────────────
   const handler = (event) => {
     const urlStr = event.detail?.url ?? '';
     if (!urlStr.startsWith(redirectUri)) return;
 
     window.removeEventListener('__capacitor_app_url_open', handler);
-    Browser.close().catch(() => {});
+    API.closeBrowser().catch(() => {});
 
     const url      = new URL(urlStr);
     const code     = url.searchParams.get('code');
@@ -57,7 +58,7 @@ async function pkceOAuthFlow({ authUrl, tokenUrl, clientId, redirectUri, extraTo
   };
 
   window.addEventListener('__capacitor_app_url_open', handler);
-  await Browser.open({ url: fullAuthUrl });
+  await API.openBrowser(fullAuthUrl);
 
   let code;
   try {

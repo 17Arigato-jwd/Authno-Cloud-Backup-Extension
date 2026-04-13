@@ -62,22 +62,20 @@ export class GDriveProvider extends BaseProvider {
 
     const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
 
-    const { Browser } = await import('@capacitor/browser');
+    // @capacitor/browser cannot be bare-imported inside a sandboxed srcdoc iframe.
+    // The host app exposes openBrowser/closeBrowser via the CloudBackupAPI bridge.
+    const API = window.CloudBackupAPI;
+    if (!API?.openBrowser) throw new Error('CloudBackupAPI.openBrowser not available');
 
     let resolveCode, rejectCode;
     const codePromise = new Promise((res, rej) => { resolveCode = res; rejectCode = rej; });
 
-    // ── FIX: listen on the DOM CustomEvent dispatched by MainActivity ─────
-    // Previously used App.addListener('appUrlOpen') which is the Capacitor
-    // native plugin bus — a completely different channel. MainActivity fires
-    // window.dispatchEvent(new CustomEvent('__capacitor_app_url_open', ...))
-    // so we must listen here, not on the Capacitor App plugin.
     const handler = (event) => {
       const urlStr = event.detail?.url ?? '';
       if (!urlStr.startsWith(REDIRECT_URI)) return;
 
       window.removeEventListener('__capacitor_app_url_open', handler);
-      Browser.close().catch(() => {});
+      API.closeBrowser().catch(() => {});
 
       const url      = new URL(urlStr);
       const code     = url.searchParams.get('code');
@@ -90,7 +88,7 @@ export class GDriveProvider extends BaseProvider {
 
     window.addEventListener('__capacitor_app_url_open', handler);
 
-    await Browser.open({ url: authUrl });
+    await API.openBrowser(authUrl);
 
     let code;
     try {

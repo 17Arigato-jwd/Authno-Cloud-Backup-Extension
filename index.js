@@ -13,6 +13,9 @@
  */
 
 import { UploadQueue }                      from './queue.js';
+// ErrorLogger is a host-app module — import via the bridge rather than directly,
+// since the extension runs as a raw ES module without webpack. We use a simple
+// console.error wrapper here; the host's ErrorLogger picks it up via the WebView console.
 import { GDriveProvider }                   from './gdrive.js';
 import { WebDAVProvider }                   from './webdav.js';
 import { DropboxProvider, OneDriveProvider } from './dropbox_onedrive.js';
@@ -26,6 +29,12 @@ const PROVIDERS = {
 
 export function activate({ registerHook, storage, navigate, extension }) {
   const queue = new UploadQueue(storage);
+
+  // Reset any permanently-failed entries from the previous session so they
+  // get one fresh attempt on this app start (answers Q3).
+  queue.resetFailed().then(changed => {
+    if (changed) console.info('[cloud-backup] Retrying previously failed uploads on app start');
+  }).catch(e => console.error('[cloud-backup] resetFailed error:', e));
 
   async function getActiveProvider() {
     const key = await storage.get('activeProvider');
