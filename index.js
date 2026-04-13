@@ -27,7 +27,7 @@ const PROVIDERS = {
   webdav:   new WebDAVProvider(),
 };
 
-export function activate({ registerHook, storage, navigate, extension }) {
+export function activate({ registerHook, storage, navigate, extension, openBrowser, closeBrowser }) {
   const queue = new UploadQueue(storage);
 
   // Reset any permanently-failed entries from the previous session so they
@@ -108,6 +108,10 @@ export function activate({ registerHook, storage, navigate, extension }) {
 
   // ── Public surface for UI pages ───────────────────────────────────────────
   window.CloudBackupAPI = {
+    // Browser bridge — extensions can't bare-import @capacitor/browser since they
+    // run as raw ES modules. These are injected by extensionRuntime.js (webpack-bundled).
+    openBrowser,
+    closeBrowser,
     providers: PROVIDERS,
     queue,
     storage,
