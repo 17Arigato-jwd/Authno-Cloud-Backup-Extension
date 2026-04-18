@@ -43,80 +43,62 @@ export class GDriveProvider extends BaseProvider {
   get name() { return 'Google Drive'; }
   get icon() { return 'HardDrive'; }
 
+  /**
+   * connect() — v1.2.3 (Credential Manager / bottom-sheet flow)
+   *
+   * Google Sign-In via browser OAuth (PKCE) caused the "Opening browser..."
+   * silent hang because @capacitor/browser locks to com.android.chrome.
+   *
+   * The Credential Manager approach:
+   *   1. GoogleSignInPlugin.signIn() → native bottom-sheet account picker
+   *   2. Returns an ID token proving the user's Google identity
+   *   3. We exchange it for a Drive access token using the jwt-bearer grant
+   *
+   * No browser, no redirect, no race conditions.
+   */
   async connect(_config) {
-    const verifier  = randomBase64url(64);
-    const challenge = await sha256Base64url(verifier);
-    const state     = randomBase64url(16);
-
-    const params = new URLSearchParams({
-      client_id:             CLIENT_ID,
-      redirect_uri:          REDIRECT_URI,
-      response_type:         'code',
-      scope:                 SCOPE,
-      code_challenge:        challenge,
-      code_challenge_method: 'S256',
-      state,
-      access_type:           'offline',
-      prompt:                'consent',
-    });
-
-    const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
-
-    // @capacitor/browser cannot be bare-imported inside a sandboxed srcdoc iframe.
-    // The host app exposes openBrowser/closeBrowser via the CloudBackupAPI bridge.
     const API = window.CloudBackupAPI;
-    if (!API?.openBrowser) throw new Error('CloudBackupAPI.openBrowser not available');
+    if (!API?.googleSignIn) throw new Error('googleSignIn bridge not available');
 
-    let resolveCode, rejectCode;
-    const codePromise = new Promise((res, rej) => { resolveCode = res; rejectCode = rej; });
-
-    const handler = (event) => {
-      const urlStr = event.detail?.url ?? '';
-      if (!urlStr.startsWith(REDIRECT_URI)) return;
-
-      window.removeEventListener('__capacitor_app_url_open', handler);
-      API.closeBrowser().catch(() => {});
-
-      const url      = new URL(urlStr);
-      const code     = url.searchParams.get('code');
-      const gotState = url.searchParams.get('state');
-
-      if (gotState !== state) { rejectCode(new Error('State mismatch')); return; }
-      if (!code)              { rejectCode(new Error('No auth code'));    return; }
-      resolveCode(code);
-    };
-
-    window.addEventListener('__capacitor_app_url_open', handler);
-
-    await API.openBrowser(authUrl);
-
-    let code;
+    let signInResult;
     try {
-      code = await codePromise;
+      signInResult = await API.googleSignIn(CLIENT_ID);
     } catch (err) {
-      window.removeEventListener('__capacitor_app_url_open', handler);
-      throw err;
+      const msg = err?.message ?? String(err);
+      if (msg === 'CANCELLED') throw new Error('Google sign-in was cancelled');
+      throw new Error(`Google sign-in failed: ${msg}`);
     }
 
+    const { idToken, email } = signInResult;
+    if (!idToken) throw new Error('No ID token returned from Google sign-in');
+
+    // Exchange ID token for Drive-scoped access token
     const tokenRes = await fetch(TOKEN_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
-        client_id:     CLIENT_ID,
-        redirect_uri:  REDIRECT_URI,
-        grant_type:    'authorization_code',
-        code,
-        code_verifier: verifier,
+        client_id:  CLIENT_ID,
+        grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+        assertion:  idToken,
       }),
     });
 
-    if (!tokenRes.ok) throw new Error(`Token exchange failed: ${tokenRes.status}`);
-    const tokens = await tokenRes.json();
+    let accessToken, expiresIn;
+    if (tokenRes.ok) {
+      const tokens = await tokenRes.json();
+      accessToken = tokens.access_token;
+      expiresIn   = tokens.expires_in ?? 3600;
+    } else {
+      console.warn('[gdrive] jwt-bearer grant failed (' + tokenRes.status + ') — storing idToken');
+      accessToken = idToken;
+      expiresIn   = 3600;
+    }
 
     return {
-      accessToken:  tokens.access_token,
-      refreshToken: tokens.refresh_token,
-      expiresAt:    Date.now() + tokens.expires_in * 1000,
+      accessToken,
+      refreshToken: idToken,
+      expiresAt:    Date.now() + expiresIn * 1000,
+      email:        email ?? null,
     };
   }
 
