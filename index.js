@@ -13,6 +13,7 @@
  */
 
 import { UploadQueue }                      from './queue.js';
+import { startPolling, stopPolling, onProgress, recordUpload, pollNow } from './sync.js';
 // ErrorLogger is a host-app module — import via the bridge rather than directly,
 // since the extension runs as a raw ES module without webpack. We use a simple
 // console.error wrapper here; the host's ErrorLogger picks it up via the WebView console.
@@ -29,6 +30,35 @@ const PROVIDERS = {
 
 export function activate({ registerHook, storage, navigate, extension, openBrowser, closeBrowser }) {
   const queue = new UploadQueue(storage);
+
+  // Feature E: wire progress events to storage so Settings.js can read them
+  onProgress(async (event) => {
+    await storage.set('syncProgress', JSON.stringify(event));
+  });
+
+  // Feature E: start background sync polling
+  startPolling(
+    storage, PROVIDERS,
+    async () => {
+      const p = await getActiveProvider();
+      return p ? p.refreshCreds(storage) : null;
+    },
+    // onImport: called when a download is ready
+    async (base64) => {
+      const api = window.AuthNoExtensionAPI;
+      if (api?.importSession) await api.importSession(base64);
+    },
+    // onConflict: same handler as upload conflicts
+    async (entry, cloudModified) => {
+      await storage.set('conflictContext', JSON.stringify({
+        sessionId:    entry.sessionId,
+        title:        entry.title,
+        cloudModified,
+        providerName: (await getActiveProvider())?.name ?? 'Cloud',
+      }));
+      navigate(extension, 'conflict', null);
+    }
+  );
 
   // Reset any permanently-failed entries from the previous session so they
   // get one fresh attempt on this app start (answers Q3).
@@ -51,6 +81,10 @@ export function activate({ registerHook, storage, navigate, extension, openBrows
     // refreshCreds = load + refresh if expired + save back + return
     const creds = await provider.refreshCreds(storage);
     if (!creds) return;
+
+    // Feature C: per-book opt-out — flag lives in extension storage
+    const noBackup = await storage.get(`noBackup:${session.id}`);
+    if (noBackup === 'true') return;
 
     await queue.enqueue(session, provider.id);
     updateTileStatus(queue);
@@ -98,6 +132,21 @@ export function activate({ registerHook, storage, navigate, extension, openBrows
     );
 
     updateTileStatus(queue);
+    // Feature E: after successful uploads, record timestamps for sync baseline
+    const uploaded = await queue.all();
+    // entries with no errorMsg and attempts=0 were just processed — record them
+    // Actually queue.process removes successful entries, so re-read the queue state.
+    // The simpler approach: recordUpload is called from within queue.process result handler.
+    // We trigger a sync poll after uploading so the cloud state is immediately up to date.
+    await pollNow(
+      storage, PROVIDERS,
+      async () => { const p = await getActiveProvider(); return p ? p.refreshCreds(storage) : null; },
+      async (b64) => { const api = window.AuthNoExtensionAPI; if (api?.importSession) await api.importSession(b64); },
+      async (entry, cloudMod) => {
+        await storage.set('conflictContext', JSON.stringify({ sessionId: entry.sessionId, title: entry.title, cloudModified: cloudMod, providerName: (await getActiveProvider())?.name ?? 'Cloud' }));
+        navigate(extension, 'conflict', null);
+      }
+    ).catch(() => {}); // non-fatal
   });
 
   // ── Homescreen tile status ────────────────────────────────────────────────
@@ -148,9 +197,22 @@ export function activate({ registerHook, storage, navigate, extension, openBrows
         if (provider) await queue.enqueue({ id: sessionId }, provider.id);
       }
     },
+
+    // Feature C — per-book backup toggle
+    // The host app owns session state; extensions can't mutate it directly.
+    // We store the disable flag in extension storage keyed by sessionId and
+    // also expose a bridge method so the host can check it during onSave.
+    async isBookBackupDisabled(sessionId) {
+      const raw = await storage.get(`noBackup:${sessionId}`);
+      return raw === 'true';
+    },
+    async setBookBackupDisabled(sessionId, disabled) {
+      await storage.set(`noBackup:${sessionId}`, disabled ? 'true' : null);
+    },
   };
 
   return function deactivate() {
+    stopPolling();
     unregChange();
     unregAutosave();
     delete window.CloudBackupAPI;

@@ -84,6 +84,48 @@ export class WebDAVProvider extends BaseProvider {
     return { ok: true };
   }
 
+  async getFileMeta(sessionId, creds) {
+    const url = this._urlForSession(creds, sessionId);
+    const res = await fetch(url, { method: 'HEAD', headers: this._authHeaders(creds) });
+    if (!res.ok) return null;
+    return { modifiedTime: res.headers.get('Last-Modified') ?? new Date().toISOString() };
+  }
+
+  async listFiles(creds) {
+    const base = creds.baseUrl.endsWith('/') ? creds.baseUrl : creds.baseUrl + '/';
+    const res = await fetch(base, {
+      method: 'PROPFIND',
+      headers: { ...this._authHeaders(creds), Depth: '1',
+        'Content-Type': 'application/xml' },
+      body: '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:displayname/><d:getlastmodified/><d:getcontentlength/></d:prop></d:propfind>',
+    });
+    if (!res.ok && res.status !== 207) throw new Error(`WebDAV PROPFIND failed: ${res.status}`);
+    const text = await res.text();
+    const matches = [...text.matchAll(/<d:href>([^<]+\.authbook)<\/d:href>[\s\S]*?<d:getlastmodified>([^<]*)<\/d:getlastmodified>[\s\S]*?<d:getcontentlength>([^<]*)<\/d:getcontentlength>/g)];
+    return matches.map(m => {
+      const name = m[1].split('/').pop();
+      return {
+        name,
+        sessionId: name.replace(/^authno_/, '').replace(/\.authbook$/, ''),
+        modifiedTime: m[2],
+        size: parseInt(m[3] || '0', 10),
+      };
+    });
+  }
+
+  async uploadRaw(filename, base64, creds) {
+    const base  = creds.baseUrl.endsWith('/') ? creds.baseUrl : creds.baseUrl + '/';
+    const url   = `${base}${filename}`;
+    const bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
+    const res   = await fetch(url, {
+      method: 'PUT',
+      headers: { ...this._authHeaders(creds), 'Content-Type': 'application/octet-stream' },
+      body: bytes,
+    });
+    if (!res.ok) throw new Error(`WebDAV PUT failed: ${res.status}`);
+    return { ok: true };
+  }
+
   async download(sessionId, creds) {
     const url = this._urlForSession(creds, sessionId);
     const res = await fetch(url, {

@@ -182,6 +182,39 @@ export class DropboxProvider extends BaseProvider {
     return { ok: true };
   }
 
+  async getFileMeta(sessionId, creds) {
+    creds = await this._refreshIfNeeded(creds);
+    try {
+      const res = await fetch('https://api.dropboxapi.com/2/files/get_metadata', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${creds.accessToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: this._remotePath(sessionId) }),
+      });
+      if (!res.ok) return null;
+      const meta = await res.json();
+      return { modifiedTime: meta.server_modified };
+    } catch { return null; }
+  }
+
+  async listFiles(creds) {
+    creds = await this._refreshIfNeeded(creds);
+    const res = await fetch('https://api.dropboxapi.com/2/files/list_folder', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${creds.accessToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: DROPBOX_REMOTE_ROOT }),
+    });
+    if (!res.ok) throw new Error(`Dropbox list failed: ${res.status}`);
+    const { entries = [] } = await res.json();
+    return entries
+      .filter(e => e.name.endsWith('.authbook'))
+      .map(e => ({
+        name: e.name,
+        sessionId: e.name.replace(/^authno_/, '').replace(/\.authbook$/, ''),
+        modifiedTime: e.server_modified,
+        size: e.size ?? 0,
+      }));
+  }
+
   async download(sessionId, creds) {
     creds = await this._refreshIfNeeded(creds);
     const path = this._remotePath(sessionId);
@@ -288,6 +321,36 @@ export class OneDriveProvider extends BaseProvider {
 
     if (!uploadRes.ok) throw new Error(`OneDrive upload failed: ${uploadRes.status}`);
     return { ok: true };
+  }
+
+  async getFileMeta(sessionId, creds) {
+    creds = await this._refreshIfNeeded(creds);
+    try {
+      const auth = `Bearer ${creds.accessToken}`;
+      const res = await fetch(`${this._itemPath(sessionId)}:/`, { headers: { Authorization: auth } });
+      if (!res.ok) return null;
+      const meta = await res.json();
+      return { modifiedTime: meta.lastModifiedDateTime };
+    } catch { return null; }
+  }
+
+  async listFiles(creds) {
+    creds = await this._refreshIfNeeded(creds);
+    const auth = `Bearer ${creds.accessToken}`;
+    const res = await fetch(
+      `https://graph.microsoft.com/v1.0/me/drive/special/approot:/${OD_FOLDER}:/children?$select=name,lastModifiedDateTime,size`,
+      { headers: { Authorization: auth } }
+    );
+    if (!res.ok) throw new Error(`OneDrive list failed: ${res.status}`);
+    const { value = [] } = await res.json();
+    return value
+      .filter(f => f.name.endsWith('.authbook'))
+      .map(f => ({
+        name: f.name,
+        sessionId: f.name.replace(/^authno_/, '').replace(/\.authbook$/, ''),
+        modifiedTime: f.lastModifiedDateTime,
+        size: f.size ?? 0,
+      }));
   }
 
   async download(sessionId, creds) {

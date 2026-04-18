@@ -234,6 +234,89 @@ export class GDriveProvider extends BaseProvider {
     return { ok: true };
   }
 
+  /**
+   * Get cloud file metadata without downloading the content.
+   * Used by sync.js polling to cheaply check if cloud is newer.
+   * Returns { modifiedTime } or null if file doesn't exist.
+   */
+  async getFileMeta(sessionId, creds) {
+    creds = await this._refreshIfNeeded(creds);
+    const auth     = `Bearer ${creds.accessToken}`;
+    const fname    = remoteFileName(sessionId);
+    const folderId = await this._getOrCreateFolder(auth);
+    const q        = encodeURIComponent(
+      `name='${fname}' and '${folderId}' in parents and trashed=false`
+    );
+    const res = await fetch(
+      `${API_BASE}/drive/v3/files?q=${q}&fields=files(id,modifiedTime)&spaces=drive`,
+      { headers: { Authorization: auth } }
+    );
+    if (!res.ok) throw new Error(`Drive meta failed: ${res.status}`);
+    const { files } = await res.json();
+    return files?.[0] ? { modifiedTime: files[0].modifiedTime, fileId: files[0].id } : null;
+  }
+
+  /**
+   * List all .authbook files in the AuthNo folder.
+   * Used by CloudFilePicker.js (Feature B) to show available cloud files.
+   * Returns [{ name, sessionId, modifiedTime, size }]
+   */
+  async listFiles(creds) {
+    creds = await this._refreshIfNeeded(creds);
+    const auth     = `Bearer ${creds.accessToken}`;
+    const folderId = await this._getOrCreateFolder(auth);
+    const q        = encodeURIComponent(
+      `'${folderId}' in parents and trashed=false and name contains '.authbook'`
+    );
+    const res = await fetch(
+      `${API_BASE}/drive/v3/files?q=${q}&fields=files(id,name,modifiedTime,size)&spaces=drive&orderBy=modifiedTime+desc`,
+      { headers: { Authorization: auth } }
+    );
+    if (!res.ok) throw new Error(`Drive list failed: ${res.status}`);
+    const { files } = await res.json();
+    return (files ?? []).map(f => ({
+      fileId:      f.id,
+      name:        f.name,
+      sessionId:   f.name.replace(/^authno_/, '').replace(/\.authbook$/, ''),
+      modifiedTime: f.modifiedTime,
+      size:        parseInt(f.size ?? '0', 10),
+    }));
+  }
+
+  /** Upload arbitrary bytes (Feature A: export to cloud). */
+  async uploadRaw(filename, base64, creds) {
+    creds = await this._refreshIfNeeded(creds);
+    const auth     = `Bearer ${creds.accessToken}`;
+    const folderId = await this._getOrCreateFolder(auth);
+    const bytes    = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
+    const boundary = 'authno_raw_xk9';
+    const meta     = JSON.stringify({ name: filename, parents: [folderId] });
+    const part1    = new TextEncoder().encode(`--${boundary}
+Content-Type: application/json; charset=UTF-8
+
+${meta}
+`);
+    const part2    = new TextEncoder().encode(`--${boundary}
+Content-Type: application/octet-stream
+
+`);
+    const end      = new TextEncoder().encode(`
+--${boundary}--`);
+    const merged   = new Uint8Array(part1.length + part2.length + bytes.length + end.length);
+    let off = 0;
+    merged.set(part1, off); off += part1.length;
+    merged.set(part2, off); off += part2.length;
+    merged.set(bytes, off); off += bytes.length;
+    merged.set(end,   off);
+    const res = await fetch(`${API_BASE}/upload/drive/v3/files?uploadType=multipart`, {
+      method: 'POST',
+      headers: { Authorization: auth, 'Content-Type': `multipart/related; boundary=${boundary}` },
+      body: merged,
+    });
+    if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
+    return { ok: true };
+  }
+
   async download(sessionId, creds) {
     creds = await this._refreshIfNeeded(creds);
     const auth     = `Bearer ${creds.accessToken}`;
