@@ -332,4 +332,30 @@ export class DropboxProvider extends BaseProvider {
     const b64        = _arrayBufferToBase64(buf);
     return { base64: b64, modifiedAt: meta.server_modified ?? new Date().toISOString() };
   }
+
+  /**
+   * Upload any file (e.g. a .txt / .html / .epub export) to /AuthNo/<filename>.
+   * Used by the "Export to cloud" feature in Settings.js.
+   * Unlike upload() which targets the per-session .authbook path, this lets the
+   * caller choose an arbitrary filename under the AuthNo root folder.
+   */
+  async uploadRaw(filename, base64, creds) {
+    creds = await this._refreshIfNeeded(creds);
+    const bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
+    const res = await fetch('https://content.dropboxapi.com/2/files/upload', {
+      method: 'POST',
+      headers: {
+        Authorization:     `Bearer ${creds.accessToken}`,
+        'Content-Type':    'application/octet-stream',
+        'Dropbox-API-Arg': JSON.stringify({
+          path:        `/AuthNo/${filename}`,
+          mode:        'overwrite',
+          autorename:  false,
+          mute:        true,
+        }),
+      },
+      body: bytes,
+    });
+    if (!res.ok) throw new Error(`Dropbox uploadRaw failed: ${res.status}`);
+  }
 }

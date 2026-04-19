@@ -162,10 +162,22 @@ async function pkceOAuthFlow({ authUrl, tokenUrl, clientId, redirectUri, extraTo
 
 // ── GOOGLE DRIVE ──────────────────────────────────────────────────────────────
 
-// IMPORTANT: Use the WEB application client ID from Google Cloud Console,
-// not the Android client ID. The web client ID is required for PKCE flows
-// that exchange a code for tokens directly (no server middleman).
-const GDRIVE_WEB_CLIENT_ID = '779756818797-l24cufifasq14irv0tj6sf4p1q9rnpva.apps.googleusercontent.com';
+// IMPORTANT: Use the ANDROID client ID, not the Web application client ID.
+//
+// Why: Google's Web application OAuth clients enforce http/https-only redirect
+// URIs ("Invalid Redirect: must use either http or https as the scheme").
+// Custom scheme URIs like com.aurorastudios.authno:// are rejected at save
+// time, so the PKCE flow can never be registered for the Web client.
+//
+// Android-type OAuth clients are *public clients* — verified by the app's
+// package name + SHA-1 fingerprint already registered in Google Cloud Console
+// under "Authno Android". That means:
+//   • No "Authorized redirect URIs" entry is required in the console.
+//   • No client_secret is needed in the token exchange (public client PKCE).
+//   • com.aurorastudios.authno://oauth2/gdrive works as the redirect URI.
+//
+// Android client ID (Cloud Console → OAuth 2.0 Clients → "Authno Android"):
+const GDRIVE_WEB_CLIENT_ID = '779756818797-gg0m357ri7j20evljv4bv3madkoh6ojn.apps.googleusercontent.com';
 const GDRIVE_REDIRECT_URI  = 'com.aurorastudios.authno://oauth2/gdrive';
 const GDRIVE_SCOPE         = 'https://www.googleapis.com/auth/drive.file';
 const GDRIVE_FOLDER_NAME   = 'AuthNo';
@@ -371,5 +383,53 @@ export class GDriveProvider extends BaseProvider {
     // RC-5 FIX: chunked conversion — safe for large .authbook files
     const b64 = _arrayBufferToBase64(buf);
     return { base64: b64, modifiedAt: file.modifiedTime ?? new Date().toISOString() };
+  }
+
+  // ── Raw upload (for "Export to cloud" feature) ────────────────────────────
+
+  /**
+   * Upload any file to the AuthNo Drive folder under an arbitrary filename.
+   * Used by Settings.js "Export to cloud" (txt/html/epub), unlike upload()
+   * which always targets the per-session .authbook path.
+   */
+  async uploadRaw(filename, base64, creds) {
+    creds = await this._refreshIfNeeded(creds);
+    const folderId = await this._getOrCreateFolder(creds);
+
+    // Check if a file with this name already exists in the folder
+    const search = await fetch(
+      `https://www.googleapis.com/drive/v3/files?q=` +
+      encodeURIComponent(`name='${filename}' and '${folderId}' in parents and trashed=false`) +
+      `&fields=files(id)`,
+      { headers: { Authorization: `Bearer ${creds.accessToken}` } }
+    );
+    const { files = [] } = search.ok ? await search.json() : {};
+    const existing = files[0] ?? null;
+
+    const bytes    = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
+    const boundary = '-------AuthNoRawUpload';
+    const metadata = JSON.stringify({
+      name: filename,
+      ...(existing ? {} : { parents: [folderId] }),
+    });
+    const body = [
+      `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n`,
+      metadata,
+      `\r\n--${boundary}\r\nContent-Type: application/octet-stream\r\n\r\n`,
+      bytes,
+      `\r\n--${boundary}--`,
+    ];
+    const url = existing
+      ? `https://www.googleapis.com/upload/drive/v3/files/${existing.id}?uploadType=multipart`
+      : `https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart`;
+    const res = await fetch(url, {
+      method:  existing ? 'PATCH' : 'POST',
+      headers: {
+        Authorization:  `Bearer ${creds.accessToken}`,
+        'Content-Type': `multipart/related; boundary=${boundary}`,
+      },
+      body: new Blob(body),
+    });
+    if (!res.ok) throw new Error(`GDrive uploadRaw failed: ${res.status}`);
   }
 }

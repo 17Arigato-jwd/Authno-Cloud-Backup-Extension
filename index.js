@@ -246,8 +246,47 @@ export function activate({ registerHook, storage, navigate, extension, openBrows
       await storage.set('tileStatus', 'synced');
     },
 
-    // Trigger an immediate sync poll — called by the "Sync now" button.
+    // Trigger an immediate sync — called by the "Sync now" button.
+    // Phase 1: queue every enabled book and upload them all to the cloud.
+    // Phase 2: poll the cloud for any changes made on other devices.
+    //
+    // getSessions() now returns full session objects (App.js was updated to
+    // pass the complete sessions array), so encodeSession() gets the chapters
+    // it needs to produce a real .authbook file.
     async syncNow() {
+      const provider = await getActiveProvider();
+      if (provider) {
+        let freshCreds;
+        try { freshCreds = await provider.refreshCreds(storage); } catch { freshCreds = null; }
+
+        if (freshCreds) {
+          // Enqueue every session that hasn't been opted out
+          const sessions = await Promise.resolve(window.AuthNoExtensionAPI?.getSessions() ?? []);
+          for (const session of sessions) {
+            const noBackup = await storage.get(`noBackup:${session.id}`);
+            if (noBackup === 'true') continue;
+            await queue.enqueue(session, provider.id);
+          }
+          updateTileStatus(queue);
+
+          // Process the whole queue (no session-ID filter — upload everything)
+          await queue.process(async (entry) => {
+            const api = window.AuthNoExtensionAPI;
+            if (!api?.encodeSession) throw new Error('AuthNoExtensionAPI.encodeSession not available');
+            // sessions list already retrieved above; re-resolve in case of stale closure
+            const allSessions = await Promise.resolve(api.getSessions() ?? []);
+            const full = allSessions.find(s => s.id === entry.sessionId);
+            if (!full) return { ok: false, skip: true };
+            const base64 = await api.encodeSession(full);
+            const result = await provider.upload(entry, freshCreds, base64);
+            if (result?.ok) await recordUpload(storage, entry.sessionId);
+            return result;
+          }, handleConflict);
+
+          updateTileStatus(queue);
+        }
+      }
+      // Phase 2: download any cloud changes
       await pollNow(storage, PROVIDERS, getActiveCreds, handleImport, handleConflict);
     },
 
