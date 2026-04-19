@@ -1,5 +1,13 @@
 /**
- * providers/webdav.js — WebDAV provider
+ * providers/webdav.js — v1.1.0
+ *
+ * Changes from v1.0.0:
+ *   - RC-5 FIX: download() now uses _arrayBufferToBase64() (chunked, 8 192
+ *     bytes per iteration) instead of
+ *     btoa(String.fromCharCode(...new Uint8Array(buf))).
+ *     The spread form passes every byte as a JS function argument; V8 throws
+ *     RangeError: Maximum call stack size exceeded for buffers larger than
+ *     ~50 MB. .authbook files for large password vaults can exceed this limit.
  *
  * Supports any WebDAV-compatible server: Nextcloud, ownCloud, Seafile,
  * and generic self-hosted servers via basic auth or bearer token.
@@ -19,6 +27,22 @@
  */
 
 import { BaseProvider } from './base.js';
+
+// ── Shared base64 helper (RC-5 FIX: large-file safe) ─────────────────────────
+/**
+ * Converts an ArrayBuffer to a base64 string in 8 192-byte chunks.
+ * The naive spread form — btoa(String.fromCharCode(...new Uint8Array(buf))) —
+ * overflows the call stack for buffers larger than ~50 MB.
+ */
+function _arrayBufferToBase64(buf) {
+  const bytes  = new Uint8Array(buf);
+  let   binary = '';
+  const CHUNK  = 8192;
+  for (let i = 0; i < bytes.byteLength; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
 
 export class WebDAVProvider extends BaseProvider {
   constructor() { super('webdav'); }
@@ -134,8 +158,10 @@ export class WebDAVProvider extends BaseProvider {
     });
     if (!res.ok) throw new Error(`WebDAV GET failed: ${res.status}`);
 
-    const buf    = await res.arrayBuffer();
-    const base64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+    const buf = await res.arrayBuffer();
+    // RC-5 FIX: chunked conversion — safe for large .authbook files.
+    // Old code: btoa(String.fromCharCode(...new Uint8Array(buf))) → stack overflow above ~50 MB
+    const base64 = _arrayBufferToBase64(buf);
     return { base64, modifiedAt: res.headers.get('Last-Modified') ?? new Date().toISOString() };
   }
 

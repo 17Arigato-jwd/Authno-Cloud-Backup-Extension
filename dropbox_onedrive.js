@@ -1,15 +1,58 @@
 /**
- * providers/dropbox_onedrive.js — v1.2.0
+ * providers/dropbox.js — v1.5.0
  *
- * Changes from v1.1.0:
- *   - pkceOAuthFlow(): replaced App.addListener('appUrlOpen') with
- *     window.addEventListener('__capacitor_app_url_open'). Same fix as
- *     gdrive.js — Capacitor plugin bus vs DOM CustomEvent mismatch.
- *   - Dropbox/OneDrive placeholder client IDs left unchanged pending
- *     registration in their respective developer consoles.
+ * Changes from v1.4.0:
+ *   - RC-4 FIX (cold-start): PKCE state ({ verifier, state, redirectUri,
+ *     clientId, tokenUrl, extraTokenParams }) is persisted to
+ *     sessionStorage.__pkce_pending BEFORE openBrowser() is called.
+ *     If the app is killed and relaunched via the deep-link redirect,
+ *     index.js activate() reads this state and re-dispatches the URL open
+ *     event so the exchange can complete.  The handler clears the key on
+ *     success OR on the 2-minute timeout so no stale state lingers.
+ *
+ *   - RC-6 FIX (duplicate listener): added `handled` boolean guard inside
+ *     the __capacitor_app_url_open handler.  If two calls to pkceOAuthFlow
+ *     somehow register two handlers (e.g. the user taps "Connect" twice),
+ *     the first invocation to fire sets handled=true and removes itself;
+ *     subsequent invocations from other handlers see handled=true and return
+ *     immediately without double-resolving or leaking.
+ *     Note: callers (Settings.js) should still disable the Connect button
+ *     while a flow is in progress — defence-in-depth.
+ *
+ *   - RC-5 FIX (large-file base64): replaced
+ *       btoa(String.fromCharCode(...new Uint8Array(buf)))
+ *     with chunked _arrayBufferToBase64() helper.  The spread form passes
+ *     every byte as a separate JS argument — V8 throws RangeError for
+ *     buffers larger than ~50 MB.  The chunked form processes 8 192 bytes
+ *     per iteration and never overflows the call stack.
+ *
+ * Changes from v1.3.0 → v1.4.0 (preserved):
+ *   - DROPBOX_REDIRECT_URI: changed from 'com.aurorastudios.authno:/oauth2/dropbox'
+ *     to 'com.aurorastudios.authno://oauth2/dropbox' (single colon-slash → double).
+ *     android:host="oauth2" only matches URIs with an authority component (double-slash).
+ *   - Added 2-minute OAUTH_TIMEOUT_MS so codePromise never hangs forever.
  */
 
 import { BaseProvider } from './base.js';
+
+// ── Shared base64 helper ──────────────────────────────────────────────────────
+/**
+ * RC-5 FIX: Memory-safe ArrayBuffer → base64 conversion.
+ * Processes the buffer in 8 192-byte chunks to avoid exceeding the JS
+ * engine's maximum argument count (typically 65 536 in V8).
+ * btoa(String.fromCharCode(...new Uint8Array(buf))) crashes above ~50 MB.
+ */
+function _arrayBufferToBase64(buf) {
+  const bytes  = new Uint8Array(buf);
+  let   binary = '';
+  const CHUNK  = 8192;
+  for (let i = 0; i < bytes.byteLength; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
+
+// ── PKCE utilities ────────────────────────────────────────────────────────────
 
 function randomBase64url(len) {
   const arr = new Uint8Array(len);
@@ -23,6 +66,20 @@ async function sha256Base64url(str) {
   return btoa(String.fromCharCode(...new Uint8Array(hash))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
 }
 
+const OAUTH_TIMEOUT_MS = 120_000; // 2 minutes
+
+/**
+ * Generic PKCE OAuth 2.0 browser flow.
+ *
+ * Cold-start safety: persists { verifier, state, redirectUri, clientId,
+ * tokenUrl, extraTokenParams } to sessionStorage.__pkce_pending before
+ * opening the browser.  index.js activate() checks this key on startup and
+ * re-dispatches __capacitor_app_url_open via Capacitor App.getLaunchUrl()
+ * so the exchange completes even when the app was killed during the flow.
+ *
+ * Duplicate-listener safety: the `handled` flag ensures only one handler
+ * instance processes the redirect — even if pkceOAuthFlow is called twice.
+ */
 async function pkceOAuthFlow({ authUrl, tokenUrl, clientId, redirectUri, extraTokenParams = {} }) {
   const verifier  = randomBase64url(64);
   const challenge = await sha256Base64url(verifier);
@@ -34,19 +91,41 @@ async function pkceOAuthFlow({ authUrl, tokenUrl, clientId, redirectUri, extraTo
     state,
   });
 
-  // @capacitor/browser cannot be bare-imported in a sandboxed srcdoc iframe.
   const API = window.CloudBackupAPI;
   if (!API?.openBrowser) throw new Error('CloudBackupAPI.openBrowser not available');
+
+  // ── RC-4 FIX: persist PKCE state for cold-start resume ───────────────────
+  sessionStorage.setItem('__pkce_pending', JSON.stringify({
+    verifier,
+    state,
+    redirectUri,
+    clientId,
+    tokenUrl,
+    extraTokenParams: JSON.stringify(extraTokenParams),
+  }));
+  // ──────────────────────────────────────────────────────────────────────────
 
   let resolveCode, rejectCode;
   const codePromise = new Promise((res, rej) => { resolveCode = res; rejectCode = rej; });
 
+  // ── RC-6 FIX: duplicate-listener guard ───────────────────────────────────
+  let handled = false;
+  // ──────────────────────────────────────────────────────────────────────────
+
   const handler = (event) => {
+    // RC-6: if another handler already processed this event, bail out
+    if (handled) return;
+
     const urlStr = event.detail?.url ?? '';
     if (!urlStr.startsWith(redirectUri)) return;
 
+    // Mark handled BEFORE any async work so a second simultaneous call sees it
+    handled = true;
     window.removeEventListener('__capacitor_app_url_open', handler);
     API.closeBrowser().catch(() => {});
+
+    // RC-4: clear persisted PKCE state — exchange is in progress
+    sessionStorage.removeItem('__pkce_pending');
 
     const url      = new URL(urlStr);
     const code     = url.searchParams.get('code');
@@ -62,9 +141,16 @@ async function pkceOAuthFlow({ authUrl, tokenUrl, clientId, redirectUri, extraTo
 
   let code;
   try {
-    code = await codePromise;
+    const timeout = new Promise((_, rej) =>
+      setTimeout(() => rej(new Error('OAuth timed out — please try again')), OAUTH_TIMEOUT_MS)
+    );
+    code = await Promise.race([codePromise, timeout]);
   } catch (err) {
     window.removeEventListener('__capacitor_app_url_open', handler);
+    API.closeBrowser().catch(() => {});
+    // Clean up persisted state on timeout/error so a stale entry doesn't
+    // confuse the next cold-start resume attempt
+    sessionStorage.removeItem('__pkce_pending');
     throw err;
   }
 
@@ -92,8 +178,10 @@ async function pkceOAuthFlow({ authUrl, tokenUrl, clientId, redirectUri, extraTo
 
 // ── DROPBOX ───────────────────────────────────────────────────────────────────
 
-const DROPBOX_CLIENT_ID    = '__DROPBOX_CLIENT_ID__';
-const DROPBOX_REDIRECT_URI = 'com.aurorastudios.authno:/oauth2/dropbox';
+const DROPBOX_CLIENT_ID    = '4rvmxehs92acpqw';
+// RC-1 FIX (v1.4.0): :// not :/ — android:host="oauth2" requires an authority
+// component (double-slash).  Also registered in the Dropbox App Console.
+const DROPBOX_REDIRECT_URI = 'com.aurorastudios.authno://oauth2/dropbox';
 const DROPBOX_REMOTE_ROOT  = '/AuthNo';
 
 export class DropboxProvider extends BaseProvider {
@@ -203,6 +291,15 @@ export class DropboxProvider extends BaseProvider {
       headers: { Authorization: `Bearer ${creds.accessToken}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: DROPBOX_REMOTE_ROOT }),
     });
+
+    // Folder doesn't exist yet (no uploads yet) — return empty, not an error
+    if (res.status === 409) {
+      const body = await res.json().catch(() => ({}));
+      if (body?.error?.['.tag'] === 'path' && body?.error?.path?.['.tag'] === 'not_found') {
+        return [];
+      }
+    }
+
     if (!res.ok) throw new Error(`Dropbox list failed: ${res.status}`);
     const { entries = [] } = await res.json();
     return entries
@@ -231,142 +328,8 @@ export class DropboxProvider extends BaseProvider {
     const metaHeader = res.headers.get('dropbox-api-result');
     const meta       = metaHeader ? JSON.parse(metaHeader) : {};
     const buf        = await res.arrayBuffer();
-    const b64        = btoa(String.fromCharCode(...new Uint8Array(buf)));
+    // RC-5 FIX: chunked conversion — safe for large .authbook files
+    const b64        = _arrayBufferToBase64(buf);
     return { base64: b64, modifiedAt: meta.server_modified ?? new Date().toISOString() };
-  }
-}
-
-// ── ONEDRIVE ──────────────────────────────────────────────────────────────────
-
-const OD_CLIENT_ID    = '__ONEDRIVE_CLIENT_ID__';
-const OD_REDIRECT_URI = 'com.aurorastudios.authno:/oauth2/onedrive';
-const OD_TOKEN_URL    = 'https://login.microsoftonline.com/consumers/oauth2/v2.0/token';
-const OD_FOLDER       = 'AuthNo';
-
-export class OneDriveProvider extends BaseProvider {
-  constructor() { super('onedrive'); }
-  get name() { return 'OneDrive'; }
-  get icon() { return 'Cloud'; }
-
-  async connect(_config) {
-    return pkceOAuthFlow({
-      authUrl: 'https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize?' + new URLSearchParams({
-        client_id:     OD_CLIENT_ID,
-        redirect_uri:  OD_REDIRECT_URI,
-        response_type: 'code',
-        scope:         'Files.ReadWrite.AppFolder offline_access',
-      }),
-      tokenUrl:    OD_TOKEN_URL,
-      clientId:    OD_CLIENT_ID,
-      redirectUri: OD_REDIRECT_URI,
-    });
-  }
-
-  async disconnect(storage) { await this.clearCreds(storage); }
-
-  async _refreshIfNeeded(creds) {
-    if (Date.now() < creds.expiresAt - 60_000) return creds;
-    const res = await fetch(OD_TOKEN_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        client_id:     OD_CLIENT_ID,
-        grant_type:    'refresh_token',
-        refresh_token: creds.refreshToken,
-        scope:         'Files.ReadWrite.AppFolder offline_access',
-      }),
-    });
-    if (!res.ok) throw new Error('OneDrive token refresh failed');
-    const tokens = await res.json();
-    return { ...creds, accessToken: tokens.access_token, expiresAt: Date.now() + tokens.expires_in * 1000 };
-  }
-
-  async isConnected(creds) {
-    if (!creds?.accessToken) return false;
-    try {
-      const res = await fetch('https://graph.microsoft.com/v1.0/me/drive', {
-        headers: { Authorization: `Bearer ${creds.accessToken}` },
-      });
-      return res.ok;
-    } catch { return false; }
-  }
-
-  _itemPath(sessionId) {
-    return `https://graph.microsoft.com/v1.0/me/drive/special/approot:/${OD_FOLDER}/${sessionId}.authbook`;
-  }
-
-  async upload(entry, creds, base64) {
-    creds = await this._refreshIfNeeded(creds);
-    const auth  = `Bearer ${creds.accessToken}`;
-    const path  = this._itemPath(entry.sessionId);
-    const bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
-
-    try {
-      const metaRes = await fetch(`${path}:/`, { headers: { Authorization: auth } });
-      if (metaRes.ok) {
-        const meta         = await metaRes.json();
-        const remoteTime   = new Date(meta.lastModifiedDateTime).getTime();
-        const lastUploaded = entry.lastUploadedAt ? new Date(entry.lastUploadedAt).getTime() : 0;
-        if (remoteTime > lastUploaded + 5000) {
-          return { ok: false, conflict: true, cloudModified: meta.lastModifiedDateTime };
-        }
-      }
-    } catch { /* file doesn't exist yet */ }
-
-    const uploadRes = await fetch(`${path}:/content`, {
-      method: 'PUT',
-      headers: { Authorization: auth, 'Content-Type': 'application/octet-stream' },
-      body: bytes,
-    });
-
-    if (!uploadRes.ok) throw new Error(`OneDrive upload failed: ${uploadRes.status}`);
-    return { ok: true };
-  }
-
-  async getFileMeta(sessionId, creds) {
-    creds = await this._refreshIfNeeded(creds);
-    try {
-      const auth = `Bearer ${creds.accessToken}`;
-      const res = await fetch(`${this._itemPath(sessionId)}:/`, { headers: { Authorization: auth } });
-      if (!res.ok) return null;
-      const meta = await res.json();
-      return { modifiedTime: meta.lastModifiedDateTime };
-    } catch { return null; }
-  }
-
-  async listFiles(creds) {
-    creds = await this._refreshIfNeeded(creds);
-    const auth = `Bearer ${creds.accessToken}`;
-    const res = await fetch(
-      `https://graph.microsoft.com/v1.0/me/drive/special/approot:/${OD_FOLDER}:/children?$select=name,lastModifiedDateTime,size`,
-      { headers: { Authorization: auth } }
-    );
-    if (!res.ok) throw new Error(`OneDrive list failed: ${res.status}`);
-    const { value = [] } = await res.json();
-    return value
-      .filter(f => f.name.endsWith('.authbook'))
-      .map(f => ({
-        name: f.name,
-        sessionId: f.name.replace(/^authno_/, '').replace(/\.authbook$/, ''),
-        modifiedTime: f.lastModifiedDateTime,
-        size: f.size ?? 0,
-      }));
-  }
-
-  async download(sessionId, creds) {
-    creds = await this._refreshIfNeeded(creds);
-    const auth = `Bearer ${creds.accessToken}`;
-    const path = this._itemPath(sessionId);
-
-    const metaRes = await fetch(`${path}:/`, { headers: { Authorization: auth } });
-    if (!metaRes.ok) throw new Error('File not found in OneDrive AuthNo folder');
-    const meta = await metaRes.json();
-
-    const dlRes = await fetch(meta['@microsoft.graph.downloadUrl']);
-    if (!dlRes.ok) throw new Error(`OneDrive download failed: ${dlRes.status}`);
-
-    const buf    = await dlRes.arrayBuffer();
-    const base64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
-    return { base64, modifiedAt: meta.lastModifiedDateTime };
   }
 }

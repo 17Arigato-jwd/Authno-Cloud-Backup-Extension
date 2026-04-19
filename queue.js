@@ -1,13 +1,26 @@
 /**
- * queue.js — v1.2.0
+ * queue.js — v1.3.0
  *
- * Changes from v1.1.0:
+ * Changes from v1.2.0:
  *   - process() now stamps lastUploadedAt on successful entries before removing
  *     them. Conflict detection in providers compares remoteTime > lastUploadedAt,
  *     so without this every upload after the first triggered a false conflict.
  *   - process() now removes permanently-failed entries (attempts >= MAX_TRIES)
  *     from the queue on each dirty save so they don't accumulate forever.
  *   - statusSummary() unchanged.
+ *
+ * Changes from v1.2.0 → v1.3.0:
+ *   - process() now handles { skip: true } return from uploadFn.
+ *     Previously, any non-ok, non-conflict result was treated as a thrown
+ *     error, which incremented `attempts` and applied exponential backoff to
+ *     EVERY entry in the queue — even sessions that just weren't available in
+ *     that autosave cycle. With skip: true, those entries are left completely
+ *     untouched so they remain at attempts=0 and are tried next cycle.
+ *
+ *     Root cause: index.js returned { ok: false, error: '...' } for
+ *     non-matching sessions, which fell to the catch block.
+ *     Fix: index.js now returns { ok: false, skip: true }; process() continues
+ *     without touching the entry.
  */
 
 const QUEUE_KEY  = 'uploadQueue';
@@ -90,6 +103,15 @@ export class UploadQueue {
             continue;
           }
 
+          // ── FIX (RC-3): skip sentinel ────────────────────────────────────
+          // uploadFn returns { skip: true } when this session isn't available
+          // in the current autosave cycle. Do NOT increment attempts — leave
+          // the entry exactly as-is so it is tried normally next cycle.
+          if (result?.skip) {
+            continue;
+          }
+          // ─────────────────────────────────────────────────────────────────
+
           if (result?.ok) {
             // Stamp the upload time so next conflict check has a baseline
             entry.lastUploadedAt = new Date().toISOString();
@@ -103,8 +125,6 @@ export class UploadQueue {
           entry.errorMsg  = err.message;
           entry.nextRetry = Date.now() + (BACKOFF_MS[entry.attempts] ?? BACKOFF_MS.at(-1));
           dirty = true;
-          // All upload errors surface here — visible in Android WebView DevTools
-          // and in Authno's built-in error log (Settings → Data Management → Error Log)
           console.error(`[cloud-backup] UPLOAD FAILED [${entry.title}] attempt ${entry.attempts}/${MAX_TRIES}:`, err.message, err.stack ?? '');
         }
       }

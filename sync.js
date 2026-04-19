@@ -1,17 +1,22 @@
 /**
- * sync.js — bidirectional sync engine — v1.2.3
- * Feature E: polls cloud providers for file changes and downloads newer versions.
+ * sync.js — bidirectional sync engine — v1.4.0
  *
- * Architecture:
- *   - startPolling(storage, providers, getActiveCreds, onUpdate, onProgress, onConflict)
- *     Polls every POLL_INTERVAL_MS. For each session known to the extension,
- *     checks the cloud file's modifiedTime against the locally known lastUploadedAt.
- *     If cloud is newer → download → importSession (via AuthNoExtensionAPI bridge).
+ * Changes from v1.3.0:
+ *   - RC-8 FIX: _poll() now awaits api.getSessions() via Promise.resolve()
+ *     wrapping.  Previously the result was used synchronously; if the host
+ *     app's AuthNoExtensionAPI.getSessions() returns a Promise (as all
+ *     Capacitor bridge methods do), `sessions` was a Promise object,
+ *     `sessions.length` was undefined (the early-return check silently
+ *     passed), and the for…of loop iterated zero items.  Sync polling
+ *     appeared to succeed but checked nothing.
  *
- * Progress events: { phase, current, total, sessionTitle }
- *   phase: 'checking' | 'downloading' | 'done' | 'error' | 'offline'
+ *     Promise.resolve() wrapping is safe whether the host returns a plain
+ *     array (synchronous) or a Promise (asynchronous).
  *
- * The progress bar in Settings.js reads these via a callback registered here.
+ * Changes from v1.2.3 → v1.3.0 (preserved):
+ *   - onConflict(): fixed call signature from onConflict(oneObject) to
+ *     onConflict(entry, cloudModified) to match all callers in index.js.
+ *     Previously cloudModified was always undefined in conflictContext.
  */
 
 const POLL_INTERVAL_MS = 5 * 60 * 1000;  // 5 minutes
@@ -61,7 +66,15 @@ async function _poll(storage, providers, getActiveCreds, onImport, onConflict) {
   // Get all sessions from the host app
   const api = window.AuthNoExtensionAPI;
   if (!api?.getSessions) return;
-  const sessions = api.getSessions();
+
+  // ── RC-8 FIX: await getSessions ──────────────────────────────────────────
+  // AuthNoExtensionAPI.getSessions() may return a Promise (Capacitor bridges
+  // are async). Without await, sessions was a Promise object; sessions.length
+  // was undefined; the for…of loop never ran; sync polling was silently a
+  // no-op.  Promise.resolve() is safe for both sync and async implementations.
+  const sessions = await Promise.resolve(api.getSessions());
+  // ─────────────────────────────────────────────────────────────────────────
+
   if (!sessions.length) { emit({ phase: 'done', current: 0, total: 0 }); return; }
 
   const total = sessions.length;
@@ -79,7 +92,6 @@ async function _poll(storage, providers, getActiveCreds, onImport, onConflict) {
     } catch {}
 
     const lastUploadedAt   = syncState.lastUploadedAt ?? null;
-    const lastDownloadedAt = syncState.lastDownloadedAt ?? null;
 
     try {
       // Check cloud metadata without downloading
@@ -94,14 +106,14 @@ async function _poll(storage, providers, getActiveCreds, onImport, onConflict) {
       if (remoteTime > uploadTime + 5000 && remoteTime > localTime + 5000) {
         // Conflict: both local and cloud have been modified since last sync
         if (localTime > uploadTime + 5000) {
-          onConflict({ sessionId, title, cloudModified: remoteMeta.modifiedTime, providerName: provider.name });
+          onConflict({ sessionId, title }, remoteMeta.modifiedTime);
           continue;
         }
 
         // Cloud is authoritative — download
         emit({ phase: 'downloading', current, total, sessionTitle: title });
         const { base64 } = await provider.download(sessionId, creds);
-        await api.importSession(base64);
+        await onImport(base64);
 
         // Record download time
         syncState.lastDownloadedAt = new Date().toISOString();

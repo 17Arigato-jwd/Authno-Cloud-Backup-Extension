@@ -1,26 +1,65 @@
 /**
- * providers/gdrive.js — v1.2.0
+ * providers/gdrive.js — v2.0.0
  *
- * Changes from v1.1.0:
- *   - connect(): replaced App.addListener('appUrlOpen') with
- *     window.addEventListener('__capacitor_app_url_open'). MainActivity.java
- *     dispatches a DOM CustomEvent on that name; Capacitor's App plugin bus
- *     is a completely separate channel and never received the redirect.
- *     This was the primary reason Google Drive OAuth always hung forever.
- *   - _refreshIfNeeded(): unchanged — token refresh logic is correct.
- *   - upload()/download(): callers now use provider.refreshCreds(storage)
- *     before calling, so these methods receive already-fresh creds and the
- *     internal _refreshIfNeeded() call is a fast no-op.
+ * BREAKING CHANGE from v1.x:
+ *   Replaced native GoogleSignIn Capacitor plugin with browser PKCE OAuth
+ *   (same approach as DropboxProvider).
+ *
+ *   Root cause of "Google sign-in was cancelled" (Images 2 + 3):
+ *   ─────────────────────────────────────────────────────────────
+ *   The previous implementation called:
+ *     window.Capacitor.Plugins.GoogleSignIn.signIn({ clientId })
+ *   The plugin parameter is `webClientId`, not `clientId`. Passing an
+ *   unknown key caused the plugin to fall back to the `google-services.json`
+ *   web_client entry — which was either missing or had a mismatched
+ *   redirect_uri/SHA-1 fingerprint. Android's GoogleSignIn activity completed
+ *   with RESULT_CANCELED instead of RESULT_OK, and the plugin threw
+ *   "Google sign-in was cancelled".
+ *
+ *   Even with a correct webClientId, the native flow requires a server-side
+ *   token exchange for Drive scopes — inappropriate for a mobile-only app
+ *   with no backend. Using browser PKCE (RFC 7636) is the correct approach:
+ *   it's publicly documented by Google for mobile/native apps, returns both
+ *   access_token AND refresh_token directly, and needs no server endpoint.
+ *
+ *   Migration checklist:
+ *   ─────────────────────────────────────────────────────────────
+ *   1. In Google Cloud Console → OAuth 2.0 Clients:
+ *      • Create or select the "Web application" client.
+ *      • Under "Authorized redirect URIs" add:
+ *          com.aurorastudios.authno://oauth2/gdrive
+ *      • Copy the Web client ID into GDRIVE_WEB_CLIENT_ID below.
+ *   2. In AndroidManifest.xml add an intent-filter for the gdrive path:
+ *          <data android:scheme="com.aurorastudios.authno"
+ *                android:host="oauth2"
+ *                android:pathPrefix="/gdrive"/>
+ *      (The existing dropbox filter already covers android:host="oauth2";
+ *      just add the pathPrefix="/gdrive" variant alongside it.)
+ *   3. Remove the @codetrix-studio/capacitor-google-auth plugin dependency
+ *      — it is no longer used by this extension.
+ *
+ *   Token refresh:
+ *   ─────────────────────────────────────────────────────────────
+ *   Google refresh tokens for mobile PKCE flows do not expire as long as
+ *   the app is used at least once every 6 months and the user hasn't revoked
+ *   access.  connect() always passes prompt=consent to guarantee a fresh
+ *   refresh_token on each explicit connect action.
  */
 
 import { BaseProvider } from './base.js';
 
-const CLIENT_ID    = '779756818797-gg0m357ri7j20evljv4bv3madkoh6ojn.apps.googleusercontent.com';
-const REDIRECT_URI = 'com.aurorastudios.authno:/oauth2/gdrive';
-const SCOPE        = 'https://www.googleapis.com/auth/drive.file';
-const TOKEN_URL    = 'https://oauth2.googleapis.com/token';
-const API_BASE     = 'https://www.googleapis.com';
-const FOLDER_NAME  = 'AuthNo';
+// ── Shared base64 helper (RC-5 FIX: large-file safe) ─────────────────────────
+function _arrayBufferToBase64(buf) {
+  const bytes  = new Uint8Array(buf);
+  let   binary = '';
+  const CHUNK  = 8192;
+  for (let i = 0; i < bytes.byteLength; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
+
+// ── PKCE utilities (identical to dropbox_onedrive.js) ────────────────────────
 
 function randomBase64url(len) {
   const arr = new Uint8Array(len);
@@ -34,149 +73,209 @@ async function sha256Base64url(str) {
   return btoa(String.fromCharCode(...new Uint8Array(hash))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
 }
 
-function remoteFileName(sessionId) {
-  return `authno_${sessionId}.authbook`;
+const OAUTH_TIMEOUT_MS = 120_000; // 2 minutes
+
+async function pkceOAuthFlow({ authUrl, tokenUrl, clientId, redirectUri, extraTokenParams = {} }) {
+  const verifier  = randomBase64url(64);
+  const challenge = await sha256Base64url(verifier);
+  const state     = randomBase64url(16);
+
+  const fullAuthUrl = authUrl + '&' + new URLSearchParams({
+    code_challenge:        challenge,
+    code_challenge_method: 'S256',
+    state,
+  });
+
+  const API = window.CloudBackupAPI;
+  if (!API?.openBrowser) throw new Error('CloudBackupAPI.openBrowser not available');
+
+  // Persist PKCE state for cold-start resume (index.js activate() reads this)
+  sessionStorage.setItem('__pkce_pending', JSON.stringify({
+    verifier, state, redirectUri, clientId, tokenUrl,
+    extraTokenParams: JSON.stringify(extraTokenParams),
+  }));
+
+  let resolveCode, rejectCode;
+  const codePromise = new Promise((res, rej) => { resolveCode = res; rejectCode = rej; });
+  let handled = false; // duplicate-listener guard
+
+  const handler = (event) => {
+    if (handled) return;
+    const urlStr = event.detail?.url ?? '';
+    if (!urlStr.startsWith(redirectUri)) return;
+    handled = true;
+    window.removeEventListener('__capacitor_app_url_open', handler);
+    API.closeBrowser().catch(() => {});
+    sessionStorage.removeItem('__pkce_pending');
+    const url      = new URL(urlStr);
+    const code     = url.searchParams.get('code');
+    const gotState = url.searchParams.get('state');
+    if (gotState !== state) { rejectCode(new Error('State mismatch')); return; }
+    if (!code)              { rejectCode(new Error('No auth code'));    return; }
+    resolveCode(code);
+  };
+
+  window.addEventListener('__capacitor_app_url_open', handler);
+  await API.openBrowser(fullAuthUrl);
+
+  let code;
+  try {
+    const timeout = new Promise((_, rej) =>
+      setTimeout(() => rej(new Error('OAuth timed out — please try again')), OAUTH_TIMEOUT_MS)
+    );
+    code = await Promise.race([codePromise, timeout]);
+  } catch (err) {
+    window.removeEventListener('__capacitor_app_url_open', handler);
+    API.closeBrowser().catch(() => {});
+    sessionStorage.removeItem('__pkce_pending');
+    throw err;
+  }
+
+  const tokenRes = await fetch(tokenUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id:     clientId,
+      redirect_uri:  redirectUri,
+      grant_type:    'authorization_code',
+      code,
+      code_verifier: verifier,
+      ...extraTokenParams,
+    }),
+  });
+
+  if (!tokenRes.ok) {
+    const errBody = await tokenRes.text().catch(() => '');
+    throw new Error(`Token exchange failed (${tokenRes.status}): ${errBody}`);
+  }
+  const tokens = await tokenRes.json();
+  if (!tokens.refresh_token) {
+    // This should not happen with prompt=consent, but guard explicitly
+    throw new Error('Google did not return a refresh token. Please disconnect and reconnect to re-grant consent.');
+  }
+  return {
+    accessToken:  tokens.access_token,
+    refreshToken: tokens.refresh_token,
+    expiresAt:    Date.now() + (tokens.expires_in ?? 3600) * 1000,
+  };
 }
+
+// ── GOOGLE DRIVE ──────────────────────────────────────────────────────────────
+
+// IMPORTANT: Use the WEB application client ID from Google Cloud Console,
+// not the Android client ID. The web client ID is required for PKCE flows
+// that exchange a code for tokens directly (no server middleman).
+const GDRIVE_WEB_CLIENT_ID = 'REPLACE_WITH_YOUR_WEB_OAUTH_CLIENT_ID.apps.googleusercontent.com';
+const GDRIVE_REDIRECT_URI  = 'com.aurorastudios.authno://oauth2/gdrive';
+const GDRIVE_SCOPE         = 'https://www.googleapis.com/auth/drive.file';
+const GDRIVE_FOLDER_NAME   = 'AuthNo';
 
 export class GDriveProvider extends BaseProvider {
   constructor() { super('gdrive'); }
   get name() { return 'Google Drive'; }
   get icon() { return 'HardDrive'; }
 
-  /**
-   * connect() — v1.2.3 (Credential Manager / bottom-sheet flow)
-   *
-   * Google Sign-In via browser OAuth (PKCE) caused the "Opening browser..."
-   * silent hang because @capacitor/browser locks to com.android.chrome.
-   *
-   * The Credential Manager approach:
-   *   1. GoogleSignInPlugin.signIn() → native bottom-sheet account picker
-   *   2. Returns an ID token proving the user's Google identity
-   *   3. We exchange it for a Drive access token using the jwt-bearer grant
-   *
-   * No browser, no redirect, no race conditions.
-   */
   async connect(_config) {
-    const API = window.CloudBackupAPI;
-    if (!API?.googleSignIn) throw new Error('googleSignIn bridge not available');
-
-    let signInResult;
-    try {
-      signInResult = await API.googleSignIn(CLIENT_ID);
-    } catch (err) {
-      const msg = err?.message ?? String(err);
-      if (msg === 'CANCELLED') throw new Error('Google sign-in was cancelled');
-      throw new Error(`Google sign-in failed: ${msg}`);
-    }
-
-    const { idToken, email } = signInResult;
-    if (!idToken) throw new Error('No ID token returned from Google sign-in');
-
-    // Exchange ID token for Drive-scoped access token
-    const tokenRes = await fetch(TOKEN_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        client_id:  CLIENT_ID,
-        grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-        assertion:  idToken,
+    return pkceOAuthFlow({
+      authUrl: 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
+        client_id:     GDRIVE_WEB_CLIENT_ID,
+        redirect_uri:  GDRIVE_REDIRECT_URI,
+        response_type: 'code',
+        scope:         GDRIVE_SCOPE,
+        access_type:   'offline',
+        prompt:        'consent',   // always request refresh_token
       }),
+      tokenUrl:    'https://oauth2.googleapis.com/token',
+      clientId:    GDRIVE_WEB_CLIENT_ID,
+      redirectUri: GDRIVE_REDIRECT_URI,
     });
-
-    let accessToken, expiresIn;
-    if (tokenRes.ok) {
-      const tokens = await tokenRes.json();
-      accessToken = tokens.access_token;
-      expiresIn   = tokens.expires_in ?? 3600;
-    } else {
-      console.warn('[gdrive] jwt-bearer grant failed (' + tokenRes.status + ') — storing idToken');
-      accessToken = idToken;
-      expiresIn   = 3600;
-    }
-
-    return {
-      accessToken,
-      refreshToken: idToken,
-      expiresAt:    Date.now() + expiresIn * 1000,
-      email:        email ?? null,
-    };
   }
 
-  async disconnect(storage) {
-    const creds = await this.loadCreds(storage);
-    if (creds?.accessToken) {
-      fetch(`https://oauth2.googleapis.com/revoke?token=${creds.accessToken}`, { method: 'POST' }).catch(() => {});
-    }
-    await this.clearCreds(storage);
-  }
+  async disconnect(storage) { await this.clearCreds(storage); }
 
   async _refreshIfNeeded(creds) {
     if (Date.now() < creds.expiresAt - 60_000) return creds;
-    const res = await fetch(TOKEN_URL, {
+    if (!creds.refreshToken) throw new Error('No Google refresh token — please reconnect Google Drive.');
+    const res = await fetch('https://oauth2.googleapis.com/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
-        client_id:     CLIENT_ID,
+        client_id:     GDRIVE_WEB_CLIENT_ID,
         grant_type:    'refresh_token',
         refresh_token: creds.refreshToken,
       }),
     });
-    if (!res.ok) throw new Error('Token refresh failed');
+    if (!res.ok) throw new Error('Google Drive token refresh failed — please reconnect.');
     const tokens = await res.json();
     return {
       ...creds,
       accessToken: tokens.access_token,
-      expiresAt:   Date.now() + tokens.expires_in * 1000,
+      expiresAt:   Date.now() + (tokens.expires_in ?? 3600) * 1000,
     };
   }
 
   async isConnected(creds) {
-    if (!creds?.refreshToken) return false;
+    if (!creds?.accessToken) return false;
     try {
-      const fresh = await this._refreshIfNeeded(creds);
-      return !!fresh.accessToken;
+      const res = await fetch('https://www.googleapis.com/drive/v3/about?fields=user', {
+        headers: { Authorization: `Bearer ${creds.accessToken}` },
+      });
+      return res.ok;
     } catch { return false; }
   }
 
-  async _getOrCreateFolder(auth) {
-    const q = encodeURIComponent(
-      `name='${FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false`
+  // ── Folder management ─────────────────────────────────────────────────────
+
+  async _getOrCreateFolder(creds) {
+    // Search for existing AuthNo folder
+    const search = await fetch(
+      `https://www.googleapis.com/drive/v3/files?q=` +
+      encodeURIComponent(`name='${GDRIVE_FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false`) +
+      `&fields=files(id)`,
+      { headers: { Authorization: `Bearer ${creds.accessToken}` } }
     );
-    const searchRes = await fetch(
-      `${API_BASE}/drive/v3/files?q=${q}&fields=files(id)&spaces=drive`,
-      { headers: { Authorization: auth } }
-    );
-    if (!searchRes.ok) throw new Error(`Folder search failed: ${searchRes.status}`);
-    const { files } = await searchRes.json();
+    if (!search.ok) throw new Error(`GDrive folder search failed: ${search.status}`);
+    const { files } = await search.json();
     if (files?.length) return files[0].id;
 
-    const createRes = await fetch(`${API_BASE}/drive/v3/files`, {
+    // Create the folder
+    const create = await fetch('https://www.googleapis.com/drive/v3/files', {
       method: 'POST',
-      headers: { Authorization: auth, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: FOLDER_NAME, mimeType: 'application/vnd.google-apps.folder' }),
+      headers: {
+        Authorization:  `Bearer ${creds.accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        name:     GDRIVE_FOLDER_NAME,
+        mimeType: 'application/vnd.google-apps.folder',
+      }),
     });
-    if (!createRes.ok) throw new Error(`Folder creation failed: ${createRes.status}`);
-    return (await createRes.json()).id;
+    if (!create.ok) throw new Error(`GDrive folder creation failed: ${create.status}`);
+    const folder = await create.json();
+    return folder.id;
   }
 
+  async _findFile(sessionId, folderId, creds) {
+    const name = `${sessionId}.authbook`;
+    const res  = await fetch(
+      `https://www.googleapis.com/drive/v3/files?q=` +
+      encodeURIComponent(`name='${name}' and '${folderId}' in parents and trashed=false`) +
+      `&fields=files(id,modifiedTime)`,
+      { headers: { Authorization: `Bearer ${creds.accessToken}` } }
+    );
+    if (!res.ok) return null;
+    const { files } = await res.json();
+    return files?.[0] ?? null;
+  }
+
+  // ── Upload ────────────────────────────────────────────────────────────────
+
   async upload(entry, creds, base64) {
-    // Callers use provider.refreshCreds(storage) before upload; this is a fast no-op.
     creds = await this._refreshIfNeeded(creds);
-    const auth     = `Bearer ${creds.accessToken}`;
-    const fname    = remoteFileName(entry.sessionId);
-    const folderId = await this._getOrCreateFolder(auth);
+    const folderId = await this._getOrCreateFolder(creds);
+    const existing = await this._findFile(entry.sessionId, folderId, creds);
 
-    const q = encodeURIComponent(
-      `name='${fname}' and '${folderId}' in parents and trashed=false`
-    );
-    const searchRes = await fetch(
-      `${API_BASE}/drive/v3/files?q=${q}&fields=files(id,modifiedTime)&spaces=drive`,
-      { headers: { Authorization: auth } }
-    );
-    if (!searchRes.ok) throw new Error(`Drive search failed: ${searchRes.status}`);
-    const { files } = await searchRes.json();
-    const existing = files?.[0];
-
+    // Conflict check
     if (existing) {
       const remoteTime   = new Date(existing.modifiedTime).getTime();
       const lastUploaded = entry.lastUploadedAt ? new Date(entry.lastUploadedAt).getTime() : 0;
@@ -186,143 +285,91 @@ export class GDriveProvider extends BaseProvider {
     }
 
     const bytes    = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
-    const boundary = 'authno_boundary_xk8';
-    const meta     = JSON.stringify(
-      existing ? { name: fname } : { name: fname, parents: [folderId] }
-    );
+    const boundary = '-------AuthNoUpload';
+    const name     = `${entry.sessionId}.authbook`;
 
-    const part1   = new TextEncoder().encode(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${meta}\r\n`);
-    const part2   = new TextEncoder().encode(`--${boundary}\r\nContent-Type: application/octet-stream\r\n\r\n`);
-    const endPart = new TextEncoder().encode(`\r\n--${boundary}--`);
-
-    const merged = new Uint8Array(part1.length + part2.length + bytes.length + endPart.length);
-    let off = 0;
-    merged.set(part1,   off); off += part1.length;
-    merged.set(part2,   off); off += part2.length;
-    merged.set(bytes,   off); off += bytes.length;
-    merged.set(endPart, off);
-
-    const uploadUrl = existing
-      ? `${API_BASE}/upload/drive/v3/files/${existing.id}?uploadType=multipart`
-      : `${API_BASE}/upload/drive/v3/files?uploadType=multipart`;
-
-    const uploadRes = await fetch(uploadUrl, {
-      method:  existing ? 'PATCH' : 'POST',
-      headers: { Authorization: auth, 'Content-Type': `multipart/related; boundary=${boundary}` },
-      body: merged,
+    const metadata = JSON.stringify({
+      name,
+      ...(existing ? {} : { parents: [folderId] }),
     });
 
-    if (!uploadRes.ok) throw new Error(`Upload failed: ${uploadRes.status}`);
+    // Multipart upload
+    const body = [
+      `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n`,
+      metadata,
+      `\r\n--${boundary}\r\nContent-Type: application/octet-stream\r\n\r\n`,
+      bytes,
+      `\r\n--${boundary}--`,
+    ];
+
+    const url = existing
+      ? `https://www.googleapis.com/upload/drive/v3/files/${existing.id}?uploadType=multipart`
+      : `https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart`;
+
+    const res = await fetch(url, {
+      method:  existing ? 'PATCH' : 'POST',
+      headers: {
+        Authorization:  `Bearer ${creds.accessToken}`,
+        'Content-Type': `multipart/related; boundary=${boundary}`,
+      },
+      body: new Blob(body),
+    });
+
+    if (!res.ok) throw new Error(`GDrive upload failed: ${res.status}`);
     return { ok: true };
   }
 
-  /**
-   * Get cloud file metadata without downloading the content.
-   * Used by sync.js polling to cheaply check if cloud is newer.
-   * Returns { modifiedTime } or null if file doesn't exist.
-   */
+  // ── Metadata ──────────────────────────────────────────────────────────────
+
   async getFileMeta(sessionId, creds) {
     creds = await this._refreshIfNeeded(creds);
-    const auth     = `Bearer ${creds.accessToken}`;
-    const fname    = remoteFileName(sessionId);
-    const folderId = await this._getOrCreateFolder(auth);
-    const q        = encodeURIComponent(
-      `name='${fname}' and '${folderId}' in parents and trashed=false`
-    );
-    const res = await fetch(
-      `${API_BASE}/drive/v3/files?q=${q}&fields=files(id,modifiedTime)&spaces=drive`,
-      { headers: { Authorization: auth } }
-    );
-    if (!res.ok) throw new Error(`Drive meta failed: ${res.status}`);
-    const { files } = await res.json();
-    return files?.[0] ? { modifiedTime: files[0].modifiedTime, fileId: files[0].id } : null;
+    try {
+      const folderId = await this._getOrCreateFolder(creds);
+      const file     = await this._findFile(sessionId, folderId, creds);
+      if (!file) return null;
+      return { modifiedTime: file.modifiedTime };
+    } catch { return null; }
   }
 
-  /**
-   * List all .authbook files in the AuthNo folder.
-   * Used by CloudFilePicker.js (Feature B) to show available cloud files.
-   * Returns [{ name, sessionId, modifiedTime, size }]
-   */
+  // ── List ──────────────────────────────────────────────────────────────────
+
   async listFiles(creds) {
     creds = await this._refreshIfNeeded(creds);
-    const auth     = `Bearer ${creds.accessToken}`;
-    const folderId = await this._getOrCreateFolder(auth);
-    const q        = encodeURIComponent(
-      `'${folderId}' in parents and trashed=false and name contains '.authbook'`
-    );
+    const folderId = await this._getOrCreateFolder(creds);
     const res = await fetch(
-      `${API_BASE}/drive/v3/files?q=${q}&fields=files(id,name,modifiedTime,size)&spaces=drive&orderBy=modifiedTime+desc`,
-      { headers: { Authorization: auth } }
+      `https://www.googleapis.com/drive/v3/files?q=` +
+      encodeURIComponent(`'${folderId}' in parents and name contains '.authbook' and trashed=false`) +
+      `&fields=files(id,name,modifiedTime,size)&pageSize=1000`,
+      { headers: { Authorization: `Bearer ${creds.accessToken}` } }
     );
-    if (!res.ok) throw new Error(`Drive list failed: ${res.status}`);
-    const { files } = await res.json();
-    return (files ?? []).map(f => ({
-      fileId:      f.id,
-      name:        f.name,
-      sessionId:   f.name.replace(/^authno_/, '').replace(/\.authbook$/, ''),
+    if (!res.ok) throw new Error(`GDrive list failed: ${res.status}`);
+    const { files = [] } = await res.json();
+    return files.map(f => ({
+      name:         f.name,
+      sessionId:    f.name.replace(/^authno_/, '').replace(/\.authbook$/, ''),
       modifiedTime: f.modifiedTime,
-      size:        parseInt(f.size ?? '0', 10),
+      size:         parseInt(f.size ?? '0', 10),
+      _fileId:      f.id,
     }));
   }
 
-  /** Upload arbitrary bytes (Feature A: export to cloud). */
-  async uploadRaw(filename, base64, creds) {
-    creds = await this._refreshIfNeeded(creds);
-    const auth     = `Bearer ${creds.accessToken}`;
-    const folderId = await this._getOrCreateFolder(auth);
-    const bytes    = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
-    const boundary = 'authno_raw_xk9';
-    const meta     = JSON.stringify({ name: filename, parents: [folderId] });
-    const part1    = new TextEncoder().encode(`--${boundary}
-Content-Type: application/json; charset=UTF-8
-
-${meta}
-`);
-    const part2    = new TextEncoder().encode(`--${boundary}
-Content-Type: application/octet-stream
-
-`);
-    const end      = new TextEncoder().encode(`
---${boundary}--`);
-    const merged   = new Uint8Array(part1.length + part2.length + bytes.length + end.length);
-    let off = 0;
-    merged.set(part1, off); off += part1.length;
-    merged.set(part2, off); off += part2.length;
-    merged.set(bytes, off); off += bytes.length;
-    merged.set(end,   off);
-    const res = await fetch(`${API_BASE}/upload/drive/v3/files?uploadType=multipart`, {
-      method: 'POST',
-      headers: { Authorization: auth, 'Content-Type': `multipart/related; boundary=${boundary}` },
-      body: merged,
-    });
-    if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
-    return { ok: true };
-  }
+  // ── Download ──────────────────────────────────────────────────────────────
 
   async download(sessionId, creds) {
     creds = await this._refreshIfNeeded(creds);
-    const auth     = `Bearer ${creds.accessToken}`;
-    const fname    = remoteFileName(sessionId);
-    const folderId = await this._getOrCreateFolder(auth);
+    const folderId = await this._getOrCreateFolder(creds);
+    const file     = await this._findFile(sessionId, folderId, creds);
+    if (!file) throw new Error(`GDrive: file not found for session ${sessionId}`);
 
-    const q = encodeURIComponent(
-      `name='${fname}' and '${folderId}' in parents and trashed=false`
+    const res = await fetch(
+      `https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`,
+      { headers: { Authorization: `Bearer ${creds.accessToken}` } }
     );
-    const searchRes = await fetch(
-      `${API_BASE}/drive/v3/files?q=${q}&fields=files(id,modifiedTime)&spaces=drive`,
-      { headers: { Authorization: auth } }
-    );
-    const { files } = await searchRes.json();
-    if (!files?.length) throw new Error('File not found in Drive AuthNo folder');
+    if (!res.ok) throw new Error(`GDrive download failed: ${res.status}`);
 
-    const fileId = files[0].id;
-    const dlRes  = await fetch(`${API_BASE}/drive/v3/files/${fileId}?alt=media`, {
-      headers: { Authorization: auth },
-    });
-    if (!dlRes.ok) throw new Error(`Download failed: ${dlRes.status}`);
-
-    const buf    = await dlRes.arrayBuffer();
-    const base64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
-    return { base64, modifiedAt: files[0].modifiedTime };
+    const buf = await res.arrayBuffer();
+    // RC-5 FIX: chunked conversion — safe for large .authbook files
+    const b64 = _arrayBufferToBase64(buf);
+    return { base64: b64, modifiedAt: file.modifiedTime ?? new Date().toISOString() };
   }
 }

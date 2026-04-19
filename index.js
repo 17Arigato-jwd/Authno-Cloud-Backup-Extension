@@ -1,88 +1,144 @@
 /**
- * cloud-backup — index.js — v1.2.0
+ * cloud-backup — index.js — v1.4.0
  *
- * Changes from v1.1.0:
- *   - onSave(change): uses provider.refreshCreds(storage) instead of
- *     loadCreds() so expired tokens are silently renewed and saved before
- *     enqueueing. Same fix in onSave(autosave).
- *   - onSave(autosave) uploadFn: passes freshCreds (post-refresh) to
- *     provider.upload() so the upload itself never needs to refresh again.
- *   - onConflict: stores conflict context in extension storage before
- *     navigating, so ConflictResolution.js can read it via the API bridge.
- *     Previously the context was passed as the session argument and lost.
+ * Changes from v1.3.0:
+ *   - Removed OneDrive provider.
+ *   - Fixed resolveConflict('use-cloud'): was a complete no-op — now downloads
+ *     the cloud version and imports it via AuthNoExtensionAPI.
+ *   - Fixed onConflict signature mismatch: sync.js called onConflict(oneObject)
+ *     but handlers expected (entry, cloudModified) — cloudModified was always
+ *     undefined in conflictContext, breaking ConflictResolution.js date display.
+ *   - Fixed recordUpload: now called after each successful upload so the sync
+ *     engine has an accurate lastUploadedAt baseline, preventing spurious
+ *     re-downloads on the next poll.
+ *   - Added to CloudBackupAPI: getSessions, importSession, exportSessionAs,
+ *     syncNow — required by Settings.js, CloudFilePicker.js.
+ *   - Extracted shared handleConflict / handleImport / getActiveCreds helpers
+ *     to eliminate duplicated inline lambdas in pollNow calls.
+ *
+ * Changes from v1.3.0 → v1.4.0:
+ *   - RC-3 FIX: queue uploadFn now returns { skip: true } (not { ok: false,
+ *     error: '...' }) for sessions that aren't this autosave's session, so
+ *     queue.process() does not increment attempts on unrelated entries.
+ *   - RC-4 FIX (cold-start): activate() now checks sessionStorage for a
+ *     pending PKCE flow and — if one exists — retrieves the launch URL via
+ *     Capacitor.Plugins.App.getLaunchUrl() and re-dispatches
+ *     __capacitor_app_url_open so the pkceOAuthFlow handler can complete the
+ *     exchange even when the app was cold-started by the redirect.
+ *   - RC-7 FIX: resolveConflict('keep-local') now re-enqueues with { id,
+ *     title, filePath } read from conflictContext storage, not just { id }.
+ *   - Removed dead googleSignIn bridge — GDriveProvider.connect() now uses
+ *     pkceOAuthFlow directly (same pattern as Dropbox).  Keeping the bridge
+ *     would have left an unreachable code path that could confuse future
+ *     callers.
  */
 
-import { UploadQueue }                      from './queue.js';
+import { UploadQueue }                         from './queue.js';
 import { startPolling, stopPolling, onProgress, recordUpload, pollNow } from './sync.js';
-// ErrorLogger is a host-app module — import via the bridge rather than directly,
-// since the extension runs as a raw ES module without webpack. We use a simple
-// console.error wrapper here; the host's ErrorLogger picks it up via the WebView console.
-import { GDriveProvider }                   from './gdrive.js';
-import { WebDAVProvider }                   from './webdav.js';
-import { DropboxProvider, OneDriveProvider } from './dropbox_onedrive.js';
+import { GDriveProvider }                      from './gdrive.js';
+import { WebDAVProvider }                      from './webdav.js';
+import { DropboxProvider }                     from './dropbox_onedrive.js';
 
 const PROVIDERS = {
-  gdrive:   new GDriveProvider(),
-  onedrive: new OneDriveProvider(),
-  dropbox:  new DropboxProvider(),
-  webdav:   new WebDAVProvider(),
+  gdrive:  new GDriveProvider(),
+  dropbox: new DropboxProvider(),
+  webdav:  new WebDAVProvider(),
 };
 
 export function activate({ registerHook, storage, navigate, extension, openBrowser, closeBrowser }) {
   const queue = new UploadQueue(storage);
 
-  // Feature E: wire progress events to storage so Settings.js can read them
+  // Feature E: wire progress events to storage so Settings.js can poll them
   onProgress(async (event) => {
     await storage.set('syncProgress', JSON.stringify(event));
   });
 
-  // Feature E: start background sync polling
-  startPolling(
-    storage, PROVIDERS,
-    async () => {
-      const p = await getActiveProvider();
-      return p ? p.refreshCreds(storage) : null;
-    },
-    // onImport: called when a download is ready
-    async (base64) => {
-      const api = window.AuthNoExtensionAPI;
-      if (api?.importSession) await api.importSession(base64);
-    },
-    // onConflict: same handler as upload conflicts
-    async (entry, cloudModified) => {
-      await storage.set('conflictContext', JSON.stringify({
-        sessionId:    entry.sessionId,
-        title:        entry.title,
-        cloudModified,
-        providerName: (await getActiveProvider())?.name ?? 'Cloud',
-      }));
-      navigate(extension, 'conflict', null);
-    }
-  );
+  // ── RC-4 FIX: Cold-start OAuth resume ──────────────────────────────────────
+  // If the app was killed while a PKCE flow was in progress, sessionStorage
+  // holds the pending state. The redirect URL is available via getLaunchUrl().
+  // Re-dispatch __capacitor_app_url_open so pkceOAuthFlow's handler can pick
+  // it up and complete the token exchange.
+  (async () => {
+    try {
+      const pending = sessionStorage.getItem('__pkce_pending');
+      if (!pending) return;
 
-  // Reset any permanently-failed entries from the previous session so they
-  // get one fresh attempt on this app start (answers Q3).
-  queue.resetFailed().then(changed => {
-    if (changed) console.info('[cloud-backup] Retrying previously failed uploads on app start');
-  }).catch(e => console.error('[cloud-backup] resetFailed error:', e));
+      const appPlugin = window.Capacitor?.Plugins?.App;
+      if (!appPlugin) return;
+
+      const launchResult = await appPlugin.getLaunchUrl().catch(() => null);
+      const url = launchResult?.url;
+      if (!url) return;
+
+      // Only re-dispatch if the URL matches a known redirect prefix
+      const parsed = JSON.parse(pending);
+      if (!url.startsWith(parsed.redirectUri)) return;
+
+      // Give pkceOAuthFlow time to re-register its listener after module init
+      setTimeout(() => {
+        window.dispatchEvent(
+          new CustomEvent('__capacitor_app_url_open', { detail: { url } })
+        );
+      }, 100);
+    } catch (e) {
+      console.warn('[cloud-backup] cold-start OAuth resume failed:', e.message);
+    }
+  })();
+  // ──────────────────────────────────────────────────────────────────────────
+
+  // ── Shared helpers ─────────────────────────────────────────────────────────
 
   async function getActiveProvider() {
     const key = await storage.get('activeProvider');
     return key ? PROVIDERS[key] ?? null : null;
   }
 
-  // ── onSave(change) — mark session dirty ──────────────────────────────────
+  async function getActiveCreds() {
+    const p = await getActiveProvider();
+    return p ? p.refreshCreds(storage) : null;
+  }
+
+  // Unified onConflict — called from both queue.process and sync polling.
+  // Signature: (entry: { sessionId, title, filePath? }, cloudModified: string)
+  async function handleConflict(entry, cloudModified) {
+    const provider = await getActiveProvider();
+    await storage.set('conflictContext', JSON.stringify({
+      sessionId:    entry.sessionId,
+      title:        entry.title,
+      filePath:     entry.filePath ?? null,   // RC-7: persist for re-enqueue
+      cloudModified,
+      providerName: provider?.name ?? 'Cloud',
+    }));
+    navigate(extension, 'conflict', null);
+  }
+
+  // Unified onImport — called when a cloud download should be applied locally.
+  async function handleImport(base64) {
+    const api = window.AuthNoExtensionAPI;
+    if (api?.importSession) await api.importSession(base64);
+  }
+
+  // ── Background sync polling ────────────────────────────────────────────────
+
+  startPolling(storage, PROVIDERS, getActiveCreds, handleImport, handleConflict);
+
+  // Reset permanently-failed entries on app start so they get one fresh attempt
+  queue.resetFailed().then(changed => {
+    if (changed) console.info('[cloud-backup] Retrying previously failed uploads on app start');
+  }).catch(e => console.error('[cloud-backup] resetFailed error:', e));
+
+  // ── onSave(change) — mark session dirty ───────────────────────────────────
+
   const unregChange = registerHook('onSave', async ({ session, trigger }) => {
     if (trigger !== 'change') return;
 
     const provider = await getActiveProvider();
     if (!provider) return;
 
-    // refreshCreds = load + refresh if expired + save back + return
     const creds = await provider.refreshCreds(storage);
     if (!creds) return;
 
-    // Feature C: per-book opt-out — flag lives in extension storage
+    // Feature C: per-book opt-out
     const noBackup = await storage.get(`noBackup:${session.id}`);
     if (noBackup === 'true') return;
 
@@ -90,82 +146,81 @@ export function activate({ registerHook, storage, navigate, extension, openBrows
     updateTileStatus(queue);
   });
 
-  // ── onSave(autosave) — process queue ─────────────────────────────────────
+  // ── onSave(autosave) — process queue ──────────────────────────────────────
+
   const unregAutosave = registerHook('onSave', async ({ session, trigger }) => {
     if (trigger !== 'autosave') return;
 
     const provider = await getActiveProvider();
     if (!provider) return;
 
-    // Refresh once before the entire queue run; save the fresh token back.
+    // Refresh once before the full queue run; write back so token is persisted.
     const freshCreds = await provider.refreshCreds(storage);
     if (!freshCreds) return;
 
     await queue.process(
       async (entry) => {
-        const entrySession = entry.sessionId === session.id ? session : null;
-        if (!entrySession) {
-          return { ok: false, error: 'session not available in this cycle' };
+        // ── RC-3 FIX ────────────────────────────────────────────────────────
+        // Return { skip: true } instead of { ok: false, error: '...' }.
+        // queue.process() will leave this entry completely untouched — no
+        // attempt increment, no backoff — so it is retried next autosave cycle.
+        if (entry.sessionId !== session.id) {
+          return { ok: false, skip: true };
         }
+        // ────────────────────────────────────────────────────────────────────
 
         const api = window.AuthNoExtensionAPI;
         if (!api?.encodeSession) throw new Error('AuthNoExtensionAPI.encodeSession not available');
-        const base64 = await api.encodeSession(entrySession);
+        const base64 = await api.encodeSession(session);
 
-        // Pass freshCreds — already refreshed and saved, upload won't refresh again
-        return provider.upload(entry, freshCreds, base64);
+        const result = await provider.upload(entry, freshCreds, base64);
+
+        // Update the sync baseline so the next poll won't re-download this file
+        if (result?.ok) {
+          await recordUpload(storage, entry.sessionId);
+        }
+
+        return result;
       },
-      async (entry, cloudModified) => {
-        console.warn(`[cloud-backup] conflict on ${entry.title} — cloud modified ${cloudModified}`);
-
-        // Store conflict context in extension storage so ConflictResolution.js
-        // can read it via the API bridge (it has no other way to receive data).
-        await storage.set('conflictContext', JSON.stringify({
-          sessionId:    entry.sessionId,
-          title:        entry.title,
-          cloudModified,
-          providerName: provider.name,
-        }));
-
-        navigate(extension, 'conflict', null);
-      }
+      handleConflict
     );
 
     updateTileStatus(queue);
-    // Feature E: after successful uploads, record timestamps for sync baseline
-    const uploaded = await queue.all();
-    // entries with no errorMsg and attempts=0 were just processed — record them
-    // Actually queue.process removes successful entries, so re-read the queue state.
-    // The simpler approach: recordUpload is called from within queue.process result handler.
-    // We trigger a sync poll after uploading so the cloud state is immediately up to date.
-    await pollNow(
-      storage, PROVIDERS,
-      async () => { const p = await getActiveProvider(); return p ? p.refreshCreds(storage) : null; },
-      async (b64) => { const api = window.AuthNoExtensionAPI; if (api?.importSession) await api.importSession(b64); },
-      async (entry, cloudMod) => {
-        await storage.set('conflictContext', JSON.stringify({ sessionId: entry.sessionId, title: entry.title, cloudModified: cloudMod, providerName: (await getActiveProvider())?.name ?? 'Cloud' }));
-        navigate(extension, 'conflict', null);
-      }
-    ).catch(() => {}); // non-fatal
+
+    // Immediate poll after uploads so bidirectional state is up to date
+    await pollNow(storage, PROVIDERS, getActiveCreds, handleImport, handleConflict).catch(() => {});
   });
 
-  // ── Homescreen tile status ────────────────────────────────────────────────
+  // ── Helpers ────────────────────────────────────────────────────────────────
+
   async function updateTileStatus(q) {
     const status = await q.statusSummary();
     await storage.set('tileStatus', status);
   }
 
   // ── Public surface for UI pages ───────────────────────────────────────────
+
   window.CloudBackupAPI = {
-    // Browser bridge — extensions can't bare-import @capacitor/browser since they
-    // run as raw ES modules. These are injected by extensionRuntime.js (webpack-bundled).
+    // Browser bridge — extensions run as raw ES modules, can't bare-import Capacitor
     openBrowser,
     closeBrowser,
+
     providers: PROVIDERS,
     queue,
     storage,
     navigate,
     extension,
+
+    // ── Host-app API bridges ──────────────────────────────────────────────
+    getSessions:     ()               => window.AuthNoExtensionAPI?.getSessions()            ?? [],
+    importSession:   (b64)            => window.AuthNoExtensionAPI?.importSession(b64),
+    exportSessionAs: (session, fmt)   => window.AuthNoExtensionAPI?.exportSessionAs(session, fmt),
+
+    // NOTE: googleSignIn bridge removed. GDriveProvider now uses pkceOAuthFlow
+    // (browser PKCE OAuth) the same way DropboxProvider does. The native
+    // GoogleSignIn Capacitor plugin is no longer called from this extension.
+
+    // ── Status & control ──────────────────────────────────────────────────
 
     async getStatus() {
       return {
@@ -191,20 +246,45 @@ export function activate({ registerHook, storage, navigate, extension, openBrows
       await storage.set('tileStatus', 'synced');
     },
 
+    // Trigger an immediate sync poll — called by the "Sync now" button.
+    async syncNow() {
+      await pollNow(storage, PROVIDERS, getActiveCreds, handleImport, handleConflict);
+    },
+
     async resolveConflict(sessionId, resolution) {
+      const provider = await getActiveProvider();
+      if (!provider) throw new Error('No active provider');
+
       if (resolution === 'keep-local') {
-        const provider = await getActiveProvider();
-        if (provider) await queue.enqueue({ id: sessionId }, provider.id);
+        // ── RC-7 FIX: re-enqueue with full session shape ─────────────────
+        // Read title and filePath from conflictContext (written by handleConflict).
+        // Previously: queue.enqueue({ id: sessionId }) — title always 'Untitled',
+        // filePath always null.
+        const raw = await storage.get('conflictContext').catch(() => null);
+        const ctx = raw ? JSON.parse(raw) : {};
+        await queue.enqueue(
+          {
+            id:       sessionId,
+            title:    ctx.title    ?? 'Untitled',
+            filePath: ctx.filePath ?? null,
+          },
+          provider.id,
+        );
+        // ─────────────────────────────────────────────────────────────────
+
+      } else if (resolution === 'use-cloud') {
+        // Download the cloud version and import it into the app
+        const creds = await provider.refreshCreds(storage);
+        if (!creds) throw new Error('Not authenticated');
+        const { base64 } = await provider.download(sessionId, creds);
+        await handleImport(base64);
+        await recordUpload(storage, sessionId);
       }
     },
 
     // Feature C — per-book backup toggle
-    // The host app owns session state; extensions can't mutate it directly.
-    // We store the disable flag in extension storage keyed by sessionId and
-    // also expose a bridge method so the host can check it during onSave.
     async isBookBackupDisabled(sessionId) {
-      const raw = await storage.get(`noBackup:${sessionId}`);
-      return raw === 'true';
+      return (await storage.get(`noBackup:${sessionId}`)) === 'true';
     },
     async setBookBackupDisabled(sessionId, disabled) {
       await storage.set(`noBackup:${sessionId}`, disabled ? 'true' : null);

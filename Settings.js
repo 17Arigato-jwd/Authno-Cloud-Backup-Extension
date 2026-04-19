@@ -1,5 +1,17 @@
 /**
- * Settings.js — cloud-backup extension UI — v1.2.3
+ * Settings.js — cloud-backup extension UI — v1.3.2
+ *
+ * Changes from v1.3.0:
+ *   - renderOAuthConnect(): Google Drive now shows a description and loading
+ *     state that matches its native Credential Manager sign-in flow instead of
+ *     the old browser-based PKCE copy ("Opening browser…" / "You'll be taken
+ *     to Google Drive…"). For Dropbox the browser-based copy is kept as-is
+ *     because it still uses the PKCE browser flow.
+ *
+ * Changes from v1.2.3:
+ *   - Removed OneDrive provider.
+ *   - Fixed 'Sync now' button: was a fake setTimeout; now calls API.syncNow()
+ *     which triggers an actual poll via pollNow() in index.js.
  *
  * New in v1.2.3:
  *   - Sync progress bar at top (polls storage.get('syncProgress') every 2s)
@@ -17,13 +29,6 @@ const PROVIDERS = [
       <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>
       <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/>
       <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.31-8.16 2.31-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>
-    </svg>`,
-  },
-  {
-    key: 'onedrive', label: 'OneDrive', oAuth: true,
-    svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 21 21" width="22" height="22">
-      <rect x="1" y="1" width="9" height="9" fill="#F25022"/><rect x="11" y="1" width="9" height="9" fill="#7FBA00"/>
-      <rect x="1" y="11" width="9" height="9" fill="#00A4EF"/><rect x="11" y="11" width="9" height="9" fill="#FFB900"/>
     </svg>`,
   },
   {
@@ -273,20 +278,33 @@ function renderWebDAVForm() {
 
 function renderOAuthConnect(providerKey) {
   const p = PROVIDERS.find(p => p.key === providerKey);
+
+  // Google Drive uses the native Credential Manager bottom-sheet (no browser).
+  // All other OAuth providers (Dropbox) use the PKCE browser flow.
+  const isNativeAuth = providerKey === 'gdrive';
+
+  const subText = isNativeAuth
+    ? `Sign in with your Google account to authorise Authno.<br>
+       Files will be saved in a folder named <strong>AuthNo</strong> — nothing else is accessed.`
+    : `You'll be taken to ${p.label} to authorise Authno.<br>
+       Files will be saved in a folder named <strong>AuthNo</strong> — nothing else is accessed.`;
+
+  const connectingText = isNativeAuth ? 'Signing in…' : 'Opening browser…';
+
   root.innerHTML = `<div class="page">
     <h1>${p.label}</h1>
-    <p class="sub">You'll be taken to ${p.label} to authorise Authno.<br>
-      Files will be saved in a folder named <strong>AuthNo</strong> — nothing else is accessed.</p>
+    <p class="sub">${subText}</p>
     <div style="display:flex;gap:10px;margin-top:8px">
       <button class="btn btn-primary" id="oauth-go">Connect with ${p.label}</button>
       <button class="btn btn-ghost" id="oauth-back">Cancel</button>
     </div>
     <div id="oauth-err"></div>
   </div>`;
+
   document.getElementById('oauth-back').addEventListener('click', renderProviderPicker);
   document.getElementById('oauth-go').addEventListener('click', async () => {
     const btn = document.getElementById('oauth-go');
-    btn.textContent = 'Opening browser…'; btn.disabled = true;
+    btn.textContent = connectingText; btn.disabled = true;
     try {
       await getAPI().connectProvider(providerKey, {});
       await renderConnectedView();
@@ -387,12 +405,14 @@ async function renderConnectedView() {
   document.getElementById('btn-sync-now')?.addEventListener('click', async () => {
     const btn = document.getElementById('btn-sync-now');
     btn.textContent = 'Syncing…'; btn.disabled = true;
-    await API.storage.set('syncProgress', JSON.stringify({ phase: 'checking', current: 0, total: sessions.length }));
-    // Signal the extension background to poll immediately — it reads syncProgress
-    setTimeout(async () => {
+    try {
+      await API.syncNow();
+    } catch (e) {
+      console.error('[cloud-backup] syncNow error:', e);
+    } finally {
       btn.textContent = '↻ Sync now'; btn.disabled = false;
       await renderConnectedView();
-    }, 4000);
+    }
   });
 
   document.getElementById('btn-import')?.addEventListener('click', () => {

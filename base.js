@@ -30,13 +30,6 @@ export class BaseProvider {
    * Use this instead of loadCreds() before any API call.
    * Returns null if no credentials are stored.
    */
-  async refreshCreds(storage) {
-    const raw = await this.loadCreds(storage);
-    if (!raw) return null;
-    const fresh = await this._refreshIfNeeded(raw);
-    if (fresh !== raw) await this.saveCreds(storage, fresh);
-    return fresh;
-  }
 
   credsKey() { return `creds:${this.id}`; }
 
@@ -51,5 +44,14 @@ export class BaseProvider {
 
   async clearCreds(storage) {
     await storage.set(this.credsKey(), null);
+  }
+
+  async refreshCreds(storage) {
+    const raw = await this.loadCreds(storage);
+    if (!raw) return null;
+    const fresh = await this._refreshIfNeeded(raw);
+    // If the token was updated, save it back to storage immediately
+    if (fresh !== raw) await this.saveCreds(storage, fresh);
+    return fresh;
   }
 }
