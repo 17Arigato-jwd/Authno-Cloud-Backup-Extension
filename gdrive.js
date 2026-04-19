@@ -165,7 +165,7 @@ async function pkceOAuthFlow({ authUrl, tokenUrl, clientId, redirectUri, extraTo
 // IMPORTANT: Use the WEB application client ID from Google Cloud Console,
 // not the Android client ID. The web client ID is required for PKCE flows
 // that exchange a code for tokens directly (no server middleman).
-const GDRIVE_WEB_CLIENT_ID = 'REPLACE_WITH_YOUR_WEB_OAUTH_CLIENT_ID.apps.googleusercontent.com';
+const GDRIVE_WEB_CLIENT_ID = '779756818797-l24cufifasq14irv0tj6sf4p1q9rnpva.apps.googleusercontent.com';
 const GDRIVE_REDIRECT_URI  = 'com.aurorastudios.authno://oauth2/gdrive';
 const GDRIVE_SCOPE         = 'https://www.googleapis.com/auth/drive.file';
 const GDRIVE_FOLDER_NAME   = 'AuthNo';
