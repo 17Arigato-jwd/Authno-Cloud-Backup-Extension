@@ -240,9 +240,13 @@ export class DropboxProvider extends BaseProvider {
 
   async upload(entry, creds, base64) {
     creds = await this._refreshIfNeeded(creds);
-    const path  = this._remotePath(entry.sessionId);
-    const bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
+    const path     = this._remotePath(entry.sessionId);
+    const apiArg   = { path, mode: 'overwrite', autorename: false };
+    const bytes    = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
 
+    console.log(`[Dropbox] UPLOAD starting — path: ${path}, size: ${bytes.length} bytes, sessionId: ${entry.sessionId}`);
+
+    // ── Conflict check ───────────────────────────────────────────────────────
     try {
       const metaRes = await fetch('https://api.dropboxapi.com/2/files/get_metadata', {
         method: 'POST',
@@ -253,77 +257,118 @@ export class DropboxProvider extends BaseProvider {
         const meta         = await metaRes.json();
         const remoteTime   = new Date(meta.server_modified).getTime();
         const lastUploaded = entry.lastUploadedAt ? new Date(entry.lastUploadedAt).getTime() : 0;
+        console.log(`[Dropbox] CONFLICT_CHECK — remoteTime: ${meta.server_modified}, lastUploaded: ${entry.lastUploadedAt}`);
         if (remoteTime > lastUploaded + 5000) {
+          console.warn(`[Dropbox] CONFLICT detected for ${path}`);
           return { ok: false, conflict: true, cloudModified: meta.server_modified };
         }
+      } else {
+        const metaBody = await metaRes.text().catch(() => '');
+        console.log(`[Dropbox] CONFLICT_CHECK skipped (${metaRes.status}) — file likely new. Body: ${metaBody}`);
       }
-    } catch { /* file doesn't exist yet */ }
+    } catch (e) { console.log(`[Dropbox] CONFLICT_CHECK threw (file likely new): ${e.message}`); }
+
+    // ── Upload ───────────────────────────────────────────────────────────────
+    const apiArgStr = JSON.stringify(apiArg);
+    console.log(`[Dropbox] UPLOAD request — Dropbox-API-Arg: ${apiArgStr}`);
 
     const uploadRes = await fetch('https://content.dropboxapi.com/2/files/upload', {
       method: 'POST',
       headers: {
         Authorization:     `Bearer ${creds.accessToken}`,
         'Content-Type':    'application/octet-stream',
-        'Dropbox-API-Arg': JSON.stringify({ path, mode: { '.tag': 'overwrite' }, autorename: false }),
+        'Dropbox-API-Arg': apiArgStr,
       },
       body: bytes,
     });
 
     if (!uploadRes.ok) {
-      const body = await uploadRes.text().catch(() => '');
-      throw new Error(`Dropbox upload failed (${uploadRes.status}): ${body}`);
+      const body = await uploadRes.text().catch(() => '<empty body>');
+      const msg = [
+        `[Dropbox] UPLOAD FAILED`,
+        `  Operation : files/upload (auto-backup)`,
+        `  Path      : ${path}`,
+        `  API-Arg   : ${apiArgStr}`,
+        `  Status    : ${uploadRes.status} ${uploadRes.statusText}`,
+        `  Body      : ${body}`,
+      ].join('\n');
+      console.error(msg);
+      throw new Error(`Dropbox UPLOAD failed (${uploadRes.status}) — path: ${path} — ${body}`);
     }
+    console.log(`[Dropbox] UPLOAD OK — ${path}`);
     return { ok: true };
   }
 
   async getFileMeta(sessionId, creds) {
     creds = await this._refreshIfNeeded(creds);
+    const path = this._remotePath(sessionId);
     try {
       const res = await fetch('https://api.dropboxapi.com/2/files/get_metadata', {
         method: 'POST',
         headers: { Authorization: `Bearer ${creds.accessToken}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: this._remotePath(sessionId) }),
+        body: JSON.stringify({ path }),
       });
-      if (!res.ok) return null;
+      if (!res.ok) {
+        const body = await res.text().catch(() => '<empty body>');
+        console.log(`[Dropbox] GET_METADATA (${res.status}) — path: ${path} — ${body}`);
+        return null;
+      }
       const meta = await res.json();
       return { modifiedTime: meta.server_modified };
-    } catch { return null; }
+    } catch (e) {
+      console.log(`[Dropbox] GET_METADATA threw — path: ${path} — ${e.message}`);
+      return null;
+    }
   }
 
   async listFiles(creds) {
     creds = await this._refreshIfNeeded(creds);
+    console.log(`[Dropbox] LIST_FOLDER — path: ${DROPBOX_REMOTE_ROOT}`);
+
     const res = await fetch('https://api.dropboxapi.com/2/files/list_folder', {
       method: 'POST',
       headers: { Authorization: `Bearer ${creds.accessToken}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: DROPBOX_REMOTE_ROOT }),
     });
 
-    // Folder doesn't exist yet (no uploads yet) — return empty, not an error
+    // 409 = folder not found (no files uploaded yet) — treat as empty list
     if (res.status === 409) {
       const body = await res.json().catch(() => ({}));
+      console.log(`[Dropbox] LIST_FOLDER 409 — body: ${JSON.stringify(body)}`);
       if (body?.error?.['.tag'] === 'path' && body?.error?.path?.['.tag'] === 'not_found') {
+        console.log('[Dropbox] LIST_FOLDER: AuthNo folder does not exist yet (no files uploaded)');
         return [];
       }
+      throw new Error(`[Dropbox] LIST_FOLDER 409 unexpected — ${JSON.stringify(body)}`);
     }
 
     if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      throw new Error(`Dropbox list failed (${res.status}): ${body}`);
+      const body = await res.text().catch(() => '<empty body>');
+      const msg = [
+        `[Dropbox] LIST_FOLDER FAILED`,
+        `  Operation : files/list_folder`,
+        `  Path      : ${DROPBOX_REMOTE_ROOT}`,
+        `  Status    : ${res.status} ${res.statusText}`,
+        `  Body      : ${body}`,
+      ].join('\n');
+      console.error(msg);
+      throw new Error(`Dropbox LIST failed (${res.status}) — folder: ${DROPBOX_REMOTE_ROOT} — ${body}`);
     }
     const { entries = [] } = await res.json();
-    return entries
-      .filter(e => e.name.endsWith('.authbook'))
-      .map(e => ({
-        name: e.name,
-        sessionId: e.name.replace(/^authno_/, '').replace(/\.authbook$/, ''),
-        modifiedTime: e.server_modified,
-        size: e.size ?? 0,
-      }));
+    const filtered = entries.filter(e => e.name.endsWith('.authbook'));
+    console.log(`[Dropbox] LIST_FOLDER OK — ${entries.length} entries, ${filtered.length} .authbook files`);
+    return filtered.map(e => ({
+      name: e.name,
+      sessionId: e.name.replace(/^authno_/, '').replace(/\.authbook$/, ''),
+      modifiedTime: e.server_modified,
+      size: e.size ?? 0,
+    }));
   }
 
   async download(sessionId, creds) {
     creds = await this._refreshIfNeeded(creds);
     const path = this._remotePath(sessionId);
+    console.log(`[Dropbox] DOWNLOAD starting — path: ${path}`);
 
     const res = await fetch('https://content.dropboxapi.com/2/files/download', {
       method: 'POST',
@@ -333,8 +378,16 @@ export class DropboxProvider extends BaseProvider {
       },
     });
     if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      throw new Error(`Dropbox download failed (${res.status}): ${body}`);
+      const body = await res.text().catch(() => '<empty body>');
+      const msg = [
+        `[Dropbox] DOWNLOAD FAILED`,
+        `  Operation : files/download`,
+        `  Path      : ${path}`,
+        `  Status    : ${res.status} ${res.statusText}`,
+        `  Body      : ${body}`,
+      ].join('\n');
+      console.error(msg);
+      throw new Error(`Dropbox DOWNLOAD failed (${res.status}) — path: ${path} — ${body}`);
     }
 
     const metaHeader = res.headers.get('dropbox-api-result');
@@ -353,24 +406,34 @@ export class DropboxProvider extends BaseProvider {
    */
   async uploadRaw(filename, base64, creds) {
     creds = await this._refreshIfNeeded(creds);
-    const bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
+    const path   = `/AuthNo/${filename}`;
+    const apiArg = { path, mode: 'overwrite', autorename: false, mute: true };
+    const bytes  = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
+    console.log(`[Dropbox] UPLOAD_RAW starting — path: ${path}, size: ${bytes.length} bytes`);
+    console.log(`[Dropbox] UPLOAD_RAW Dropbox-API-Arg: ${JSON.stringify(apiArg)}`);
+
     const res = await fetch('https://content.dropboxapi.com/2/files/upload', {
       method: 'POST',
       headers: {
         Authorization:     `Bearer ${creds.accessToken}`,
         'Content-Type':    'application/octet-stream',
-        'Dropbox-API-Arg': JSON.stringify({
-          path:        `/AuthNo/${filename}`,
-          mode:        { '.tag': 'overwrite' },
-          autorename:  false,
-          mute:        true,
-        }),
+        'Dropbox-API-Arg': JSON.stringify(apiArg),
       },
       body: bytes,
     });
     if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      throw new Error(`Dropbox uploadRaw failed (${res.status}): ${body}`);
+      const body = await res.text().catch(() => '<empty body>');
+      const msg = [
+        `[Dropbox] UPLOAD_RAW FAILED`,
+        `  Operation : files/upload (export)`,
+        `  Path      : ${path}`,
+        `  API-Arg   : ${JSON.stringify(apiArg)}`,
+        `  Status    : ${res.status} ${res.statusText}`,
+        `  Body      : ${body}`,
+      ].join('\n');
+      console.error(msg);
+      throw new Error(`Dropbox UPLOAD_RAW failed (${res.status}) — path: ${path} — ${body}`);
     }
+    console.log(`[Dropbox] UPLOAD_RAW OK — ${path}`);
   }
 }

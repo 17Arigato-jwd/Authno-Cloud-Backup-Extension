@@ -1,7 +1,7 @@
 {
   "id": "cloud-backup",
   "name": "Cloud Backup",
-  "version": "1.4.4",
+  "version": "1.4.5",
   "description": "Automatic background sync of .authbook files to Google Drive, Dropbox, or WebDAV.",
   "author": "Aurora Studios",
   "icon": "Cloud",
