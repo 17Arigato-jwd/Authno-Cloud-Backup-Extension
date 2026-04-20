@@ -173,11 +173,12 @@ export function activate({ registerHook, storage, navigate, extension, openBrows
         if (!api?.encodeSession) throw new Error('AuthNoExtensionAPI.encodeSession not available');
         const base64 = await api.encodeSession(session);
 
+        console.log(`[cloud-backup] autosave upload: "${entry.title}" (${Math.round(base64.length * 0.75 / 1024)} KB)`);
         const result = await provider.upload(entry, freshCreds, base64);
 
-        // Update the sync baseline so the next poll won't re-download this file
         if (result?.ok) {
           await recordUpload(storage, entry.sessionId);
+          console.log(`[cloud-backup] autosave upload OK: "${entry.title}"`);
         }
 
         return result;
@@ -273,13 +274,20 @@ export function activate({ registerHook, storage, navigate, extension, openBrows
           await queue.process(async (entry) => {
             const api = window.AuthNoExtensionAPI;
             if (!api?.encodeSession) throw new Error('AuthNoExtensionAPI.encodeSession not available');
-            // sessions list already retrieved above; re-resolve in case of stale closure
             const allSessions = await Promise.resolve(api.getSessions() ?? []);
             const full = allSessions.find(s => s.id === entry.sessionId);
-            if (!full) return { ok: false, skip: true };
+            if (!full) {
+              console.warn(`[cloud-backup] syncNow: session "${entry.sessionId}" not found in getSessions() — skipping`);
+              return { ok: false, skip: true };
+            }
+            console.log(`[cloud-backup] syncNow: encoding "${full.title ?? entry.sessionId}" (chapters: ${full.chapters?.length ?? 0})`);
             const base64 = await api.encodeSession(full);
+            console.log(`[cloud-backup] syncNow: uploading "${full.title}" (${Math.round(base64.length * 0.75 / 1024)} KB)`);
             const result = await provider.upload(entry, freshCreds, base64);
-            if (result?.ok) await recordUpload(storage, entry.sessionId);
+            if (result?.ok) {
+              await recordUpload(storage, entry.sessionId);
+              console.log(`[cloud-backup] syncNow: upload OK — "${full.title}"`);
+            }
             return result;
           }, handleConflict);
 

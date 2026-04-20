@@ -59,128 +59,46 @@ function _arrayBufferToBase64(buf) {
   return btoa(binary);
 }
 
-// ── PKCE utilities (identical to dropbox_onedrive.js) ────────────────────────
+// ── Native Drive token helper ─────────────────────────────────────────────────
+//
+// Calls GoogleDrivePlugin.requestDriveToken() which uses the Google Identity
+// Authorization API (play-services-auth) to get an access token for drive.file.
+//
+// On first call: shows a native consent bottom-sheet (no browser, no custom scheme).
+// On subsequent calls: returns a fresh token silently if already authorized.
+// No refresh token or client secret needed — Identity.authorize() handles renewal.
 
-function randomBase64url(len) {
-  const arr = new Uint8Array(len);
-  crypto.getRandomValues(arr);
-  return btoa(String.fromCharCode(...arr)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
-}
-
-async function sha256Base64url(str) {
-  const enc  = new TextEncoder().encode(str);
-  const hash = await crypto.subtle.digest('SHA-256', enc);
-  return btoa(String.fromCharCode(...new Uint8Array(hash))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
-}
-
-const OAUTH_TIMEOUT_MS = 120_000; // 2 minutes
-
-async function pkceOAuthFlow({ authUrl, tokenUrl, clientId, redirectUri, extraTokenParams = {} }) {
-  const verifier  = randomBase64url(64);
-  const challenge = await sha256Base64url(verifier);
-  const state     = randomBase64url(16);
-
-  const fullAuthUrl = authUrl + '&' + new URLSearchParams({
-    code_challenge:        challenge,
-    code_challenge_method: 'S256',
-    state,
-  });
-
-  const API = window.CloudBackupAPI;
-  if (!API?.openBrowser) throw new Error('CloudBackupAPI.openBrowser not available');
-
-  // Persist PKCE state for cold-start resume (index.js activate() reads this)
-  sessionStorage.setItem('__pkce_pending', JSON.stringify({
-    verifier, state, redirectUri, clientId, tokenUrl,
-    extraTokenParams: JSON.stringify(extraTokenParams),
-  }));
-
-  let resolveCode, rejectCode;
-  const codePromise = new Promise((res, rej) => { resolveCode = res; rejectCode = rej; });
-  let handled = false; // duplicate-listener guard
-
-  const handler = (event) => {
-    if (handled) return;
-    const urlStr = event.detail?.url ?? '';
-    if (!urlStr.startsWith(redirectUri)) return;
-    handled = true;
-    window.removeEventListener('__capacitor_app_url_open', handler);
-    API.closeBrowser().catch(() => {});
-    sessionStorage.removeItem('__pkce_pending');
-    const url      = new URL(urlStr);
-    const code     = url.searchParams.get('code');
-    const gotState = url.searchParams.get('state');
-    if (gotState !== state) { rejectCode(new Error('State mismatch')); return; }
-    if (!code)              { rejectCode(new Error('No auth code'));    return; }
-    resolveCode(code);
-  };
-
-  window.addEventListener('__capacitor_app_url_open', handler);
-  await API.openBrowser(fullAuthUrl);
-
-  let code;
-  try {
-    const timeout = new Promise((_, rej) =>
-      setTimeout(() => rej(new Error('OAuth timed out — please try again')), OAUTH_TIMEOUT_MS)
+async function getNativeDriveToken() {
+  const plugin = window.Capacitor?.Plugins?.GoogleDrive;
+  if (!plugin?.requestDriveToken) {
+    throw new Error(
+      'GoogleDrive native plugin not available. ' +
+      'Make sure GoogleDrivePlugin is registered in MainActivity.java ' +
+      'and the app has been rebuilt.'
     );
-    code = await Promise.race([codePromise, timeout]);
-  } catch (err) {
-    window.removeEventListener('__capacitor_app_url_open', handler);
-    API.closeBrowser().catch(() => {});
-    sessionStorage.removeItem('__pkce_pending');
-    throw err;
   }
-
-  const tokenRes = await fetch(tokenUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      client_id:     clientId,
-      redirect_uri:  redirectUri,
-      grant_type:    'authorization_code',
-      code,
-      code_verifier: verifier,
-      ...extraTokenParams,
-    }),
-  });
-
-  if (!tokenRes.ok) {
-    const errBody = await tokenRes.text().catch(() => '');
-    throw new Error(`Token exchange failed (${tokenRes.status}): ${errBody}`);
+  const result = await plugin.requestDriveToken();
+  if (!result?.accessToken) {
+    throw new Error('GoogleDrive plugin returned no access token');
   }
-  const tokens = await tokenRes.json();
-  if (!tokens.refresh_token) {
-    // This should not happen with prompt=consent, but guard explicitly
-    throw new Error('Google did not return a refresh token. Please disconnect and reconnect to re-grant consent.');
-  }
-  return {
-    accessToken:  tokens.access_token,
-    refreshToken: tokens.refresh_token,
-    expiresAt:    Date.now() + (tokens.expires_in ?? 3600) * 1000,
-  };
+  return result.accessToken;
 }
+
+// Token validity window: refresh if less than 5 minutes remain.
+// Identity.authorize() is called each time the token nears expiry — it is
+// fast (no UI) for already-authorized users and only shows UI on first use
+// or if the user revokes access.
+const TOKEN_REFRESH_MARGIN_MS = 5 * 60 * 1000;
 
 // ── GOOGLE DRIVE ──────────────────────────────────────────────────────────────
 
-// IMPORTANT: Use the ANDROID client ID, not the Web application client ID.
-//
-// Why: Google's Web application OAuth clients enforce http/https-only redirect
-// URIs ("Invalid Redirect: must use either http or https as the scheme").
-// Custom scheme URIs like com.aurorastudios.authno:// are rejected at save
-// time, so the PKCE flow can never be registered for the Web client.
-//
-// Android-type OAuth clients are *public clients* — verified by the app's
-// package name + SHA-1 fingerprint already registered in Google Cloud Console
-// under "Authno Android". That means:
-//   • No "Authorized redirect URIs" entry is required in the console.
-//   • No client_secret is needed in the token exchange (public client PKCE).
-//   • com.aurorastudios.authno://oauth2/gdrive works as the redirect URI.
-//
-// Android client ID (Cloud Console → OAuth 2.0 Clients → "Authno Android"):
-const GDRIVE_WEB_CLIENT_ID = '779756818797-gg0m357ri7j20evljv4bv3madkoh6ojn.apps.googleusercontent.com';
-const GDRIVE_REDIRECT_URI  = 'com.aurorastudios.authno://oauth2/gdrive';
-const GDRIVE_SCOPE         = 'https://www.googleapis.com/auth/drive.file';
-const GDRIVE_FOLDER_NAME   = 'AuthNo';
+// No client ID constant needed — the native GoogleDrivePlugin calls
+// Identity.getAuthorizationClient().authorize() which uses the app's own
+// Play Services identity, verified by the SHA-1 fingerprint and package name
+// already registered in Google Cloud Console under "Authno Android".
+// No redirect URI, no client secret, no browser tab.
+const GDRIVE_SCOPE       = 'https://www.googleapis.com/auth/drive.file'; // kept for reference
+const GDRIVE_FOLDER_NAME = 'AuthNo';
 
 export class GDriveProvider extends BaseProvider {
   constructor() { super('gdrive'); }
@@ -188,42 +106,22 @@ export class GDriveProvider extends BaseProvider {
   get icon() { return 'HardDrive'; }
 
   async connect(_config) {
-    return pkceOAuthFlow({
-      authUrl: 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
-        client_id:     GDRIVE_WEB_CLIENT_ID,
-        redirect_uri:  GDRIVE_REDIRECT_URI,
-        response_type: 'code',
-        scope:         GDRIVE_SCOPE,
-        access_type:   'offline',
-        prompt:        'consent',   // always request refresh_token
-      }),
-      tokenUrl:    'https://oauth2.googleapis.com/token',
-      clientId:    GDRIVE_WEB_CLIENT_ID,
-      redirectUri: GDRIVE_REDIRECT_URI,
-    });
+    // Uses native GoogleDrivePlugin (Identity Authorization API).
+    // No browser, no custom scheme, no client secret.
+    // Shows a native consent UI on first use; silent on subsequent calls.
+    const accessToken = await getNativeDriveToken();
+    return { accessToken, expiresAt: Date.now() + 3600 * 1000 };
   }
 
   async disconnect(storage) { await this.clearCreds(storage); }
 
   async _refreshIfNeeded(creds) {
-    if (Date.now() < creds.expiresAt - 60_000) return creds;
-    if (!creds.refreshToken) throw new Error('No Google refresh token — please reconnect Google Drive.');
-    const res = await fetch('https://oauth2.googleapis.com/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        client_id:     GDRIVE_WEB_CLIENT_ID,
-        grant_type:    'refresh_token',
-        refresh_token: creds.refreshToken,
-      }),
-    });
-    if (!res.ok) throw new Error('Google Drive token refresh failed — please reconnect.');
-    const tokens = await res.json();
-    return {
-      ...creds,
-      accessToken: tokens.access_token,
-      expiresAt:   Date.now() + (tokens.expires_in ?? 3600) * 1000,
-    };
+    // Token is still valid — reuse it.
+    if (Date.now() < (creds.expiresAt ?? 0) - TOKEN_REFRESH_MARGIN_MS) return creds;
+    // Token is near expiry or missing — ask Identity API for a fresh one.
+    // For already-consented users this is instant (no UI shown).
+    const accessToken = await getNativeDriveToken();
+    return { ...creds, accessToken, expiresAt: Date.now() + 3600 * 1000 };
   }
 
   async isConnected(creds) {
@@ -246,7 +144,10 @@ export class GDriveProvider extends BaseProvider {
       `&fields=files(id)`,
       { headers: { Authorization: `Bearer ${creds.accessToken}` } }
     );
-    if (!search.ok) throw new Error(`GDrive folder search failed: ${search.status}`);
+    if (!search.ok) {
+      const body = await search.text().catch(() => '');
+      throw new Error(`GDrive folder search failed (${search.status}): ${body}`);
+    }
     const { files } = await search.json();
     if (files?.length) return files[0].id;
 
@@ -262,7 +163,10 @@ export class GDriveProvider extends BaseProvider {
         mimeType: 'application/vnd.google-apps.folder',
       }),
     });
-    if (!create.ok) throw new Error(`GDrive folder creation failed: ${create.status}`);
+    if (!create.ok) {
+      const body = await create.text().catch(() => '');
+      throw new Error(`GDrive folder creation failed (${create.status}): ${body}`);
+    }
     const folder = await create.json();
     return folder.id;
   }
@@ -327,7 +231,10 @@ export class GDriveProvider extends BaseProvider {
       body: new Blob(body),
     });
 
-    if (!res.ok) throw new Error(`GDrive upload failed: ${res.status}`);
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`GDrive upload failed (${res.status}): ${body}`);
+    }
     return { ok: true };
   }
 
@@ -354,7 +261,10 @@ export class GDriveProvider extends BaseProvider {
       `&fields=files(id,name,modifiedTime,size)&pageSize=1000`,
       { headers: { Authorization: `Bearer ${creds.accessToken}` } }
     );
-    if (!res.ok) throw new Error(`GDrive list failed: ${res.status}`);
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`GDrive list failed (${res.status}): ${body}`);
+    }
     const { files = [] } = await res.json();
     return files.map(f => ({
       name:         f.name,
@@ -377,7 +287,10 @@ export class GDriveProvider extends BaseProvider {
       `https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`,
       { headers: { Authorization: `Bearer ${creds.accessToken}` } }
     );
-    if (!res.ok) throw new Error(`GDrive download failed: ${res.status}`);
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`GDrive download failed (${res.status}): ${body}`);
+    }
 
     const buf = await res.arrayBuffer();
     // RC-5 FIX: chunked conversion — safe for large .authbook files
@@ -430,6 +343,9 @@ export class GDriveProvider extends BaseProvider {
       },
       body: new Blob(body),
     });
-    if (!res.ok) throw new Error(`GDrive uploadRaw failed: ${res.status}`);
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`GDrive uploadRaw failed (${res.status}): ${body}`);
+    }
   }
 }

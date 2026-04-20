@@ -216,7 +216,10 @@ export class DropboxProvider extends BaseProvider {
         refresh_token: creds.refreshToken,
       }),
     });
-    if (!res.ok) throw new Error('Dropbox token refresh failed');
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`Dropbox token refresh failed (${res.status}): ${body}`);
+    }
     const tokens = await res.json();
     return { ...creds, accessToken: tokens.access_token, expiresAt: Date.now() + tokens.expires_in * 1000 };
   }
@@ -261,12 +264,15 @@ export class DropboxProvider extends BaseProvider {
       headers: {
         Authorization:     `Bearer ${creds.accessToken}`,
         'Content-Type':    'application/octet-stream',
-        'Dropbox-API-Arg': JSON.stringify({ path, mode: 'overwrite', autorename: false }),
+        'Dropbox-API-Arg': JSON.stringify({ path, mode: { '.tag': 'overwrite' }, autorename: false }),
       },
       body: bytes,
     });
 
-    if (!uploadRes.ok) throw new Error(`Dropbox upload failed: ${uploadRes.status}`);
+    if (!uploadRes.ok) {
+      const body = await uploadRes.text().catch(() => '');
+      throw new Error(`Dropbox upload failed (${uploadRes.status}): ${body}`);
+    }
     return { ok: true };
   }
 
@@ -300,7 +306,10 @@ export class DropboxProvider extends BaseProvider {
       }
     }
 
-    if (!res.ok) throw new Error(`Dropbox list failed: ${res.status}`);
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`Dropbox list failed (${res.status}): ${body}`);
+    }
     const { entries = [] } = await res.json();
     return entries
       .filter(e => e.name.endsWith('.authbook'))
@@ -323,7 +332,10 @@ export class DropboxProvider extends BaseProvider {
         'Dropbox-API-Arg': JSON.stringify({ path }),
       },
     });
-    if (!res.ok) throw new Error(`Dropbox download failed: ${res.status}`);
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`Dropbox download failed (${res.status}): ${body}`);
+    }
 
     const metaHeader = res.headers.get('dropbox-api-result');
     const meta       = metaHeader ? JSON.parse(metaHeader) : {};
@@ -349,13 +361,16 @@ export class DropboxProvider extends BaseProvider {
         'Content-Type':    'application/octet-stream',
         'Dropbox-API-Arg': JSON.stringify({
           path:        `/AuthNo/${filename}`,
-          mode:        'overwrite',
+          mode:        { '.tag': 'overwrite' },
           autorename:  false,
           mute:        true,
         }),
       },
       body: bytes,
     });
-    if (!res.ok) throw new Error(`Dropbox uploadRaw failed: ${res.status}`);
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`Dropbox uploadRaw failed (${res.status}): ${body}`);
+    }
   }
 }
