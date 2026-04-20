@@ -1,24 +1,21 @@
 /**
- * Settings.js — cloud-backup extension UI — v1.3.2
+ * Settings.js — cloud-backup extension UI — v1.4.0
  *
- * Changes from v1.3.0:
- *   - renderOAuthConnect(): Google Drive now shows a description and loading
- *     state that matches its native Credential Manager sign-in flow instead of
- *     the old browser-based PKCE copy ("Opening browser…" / "You'll be taken
- *     to Google Drive…"). For Dropbox the browser-based copy is kept as-is
- *     because it still uses the PKCE browser flow.
- *
- * Changes from v1.2.3:
- *   - Removed OneDrive provider.
- *   - Fixed 'Sync now' button: was a fake setTimeout; now calls API.syncNow()
- *     which triggers an actual poll via pollNow() in index.js.
- *
- * New in v1.2.3:
- *   - Sync progress bar at top (polls storage.get('syncProgress') every 2s)
- *   - "Import from cloud" button → navigates to cloud-files page (Feature B)
- *   - Per-book backup toggle section (Feature C)
- *   - Export panel (Feature A): txt / html / epub export directly to cloud
- *   - "Sync now" button that triggers an immediate poll
+ * Changes from v1.3.2:
+ *   - Google Drive connected view replaced with a bespoke layout:
+ *       • Frosted-glass header with gradient status circle (dark→light green)
+ *       • Semi-transparent frosted-glass book-list with green iOS-style toggles
+ *       • Upload icon shown next to books that are currently in the upload queue
+ *       • Compact export card with inline green EXPORT pill button
+ *       • Amber "Import from Cloud" button that expands an inline file picker
+ *         (replaces the old navigate-to-cloud-files approach for Google Drive)
+ *       • Blue "Sync Now" + red "Disconnect" bottom row
+ *       • Progress bar that slides up from beneath the buttons on sync
+ *   - Dropbox / WebDAV connected views remain completely unchanged
+ *     (still use renderConnectedView()).
+ *   - Init routing: activeProvider === 'gdrive' → renderGDriveView(),
+ *     all other connected providers → renderConnectedView() as before.
+ *   - Added esc() utility (was missing in Settings.js, only in CloudFilePicker).
  */
 
 const PROVIDERS = [
@@ -51,6 +48,7 @@ document.head.insertAdjacentHTML('beforeend', `<style>
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-size: 14px; color: #e4e4f0; background: transparent; min-height: 100vh; }
 
+  /* ── Shared top progress bar ──────────────────────────────────────────────── */
   .progress-bar-wrap {
     position: sticky; top: 0; z-index: 10; height: 3px;
     background: #2e2e3a; overflow: hidden;
@@ -64,6 +62,7 @@ document.head.insertAdjacentHTML('beforeend', `<style>
     padding: 3px 0; background: #0f0f18; letter-spacing: .03em;
   }
 
+  /* ── Provider picker ──────────────────────────────────────────────────────── */
   .login-screen { display: flex; flex-direction: column; align-items: center;
     justify-content: center; min-height: 100vh; padding: 32px 24px; }
   .login-title { font-size: 22px; font-weight: 700; margin-bottom: 6px; }
@@ -85,6 +84,7 @@ document.head.insertAdjacentHTML('beforeend', `<style>
   .pill-label { flex: 1; }
   .pill-chevron { color: #4a4a5a; font-size: 16px; }
 
+  /* ── Generic connected page (Dropbox / WebDAV) ────────────────────────────── */
   .page { padding: 16px; max-width: 480px; margin: 0 auto; }
   h1 { font-size: 18px; font-weight: 600; margin-bottom: 4px; }
   .sub { color: #6b6b80; font-size: 13px; margin-bottom: 20px; line-height: 1.5; }
@@ -128,11 +128,252 @@ document.head.insertAdjacentHTML('beforeend', `<style>
     padding: 8px 0; border-bottom: 1px solid #2e2e3a; font-size: 12px; }
   .queue-row:last-child { border-bottom: none; }
   .error-msg { color: #ef4444; font-size: 11px; margin-top: 2px; }
-</style>`);
+
+  /* ══════════════════════════════════════════════════════════════════════════
+     GOOGLE DRIVE BESPOKE UI
+     ══════════════════════════════════════════════════════════════════════════ */
+
+  /* Shared frosted-glass tile */
+  .gd-tile {
+    background: rgba(36, 36, 50, 0.60);
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 14px;
+  }
+
+  .gd-screen {
+    padding: 14px 14px 24px;
+    max-width: 400px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  /* ① Header */
+  .gd-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 14px;
+  }
+  .gd-provider-info {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .gd-provider-name { font-size: 14px; font-weight: 600; color: #f0f0ff; }
+  .gd-provider-sub  { font-size: 11px; color: #8080a0; margin-top: 2px; }
+
+  /* Gradient circle: dark green at left → bright green at right */
+  .gd-status-circle {
+    width: 22px; height: 22px; border-radius: 50%; flex-shrink: 0;
+    background: radial-gradient(circle at 28% 50%, #14532d 0%, #4ade80 100%);
+    box-shadow: 0 0 10px rgba(74, 222, 128, 0.28);
+  }
+  .gd-status-circle.syncing {
+    background: radial-gradient(circle at 28% 50%, #78350f 0%, #fbbf24 100%);
+    box-shadow: 0 0 10px rgba(251, 191, 36, 0.28);
+    animation: pulse 1.2s ease-in-out infinite;
+  }
+  .gd-status-circle.error {
+    background: radial-gradient(circle at 28% 50%, #7f1d1d 0%, #f87171 100%);
+    box-shadow: 0 0 10px rgba(248, 113, 113, 0.28);
+  }
+
+  /* ② Book list */
+  .gd-book-list {
+    padding: 4px 12px;
+    display: flex;
+    flex-direction: column;
+    max-height: 220px;
+    overflow-y: auto;
+  }
+  .gd-book-list::-webkit-scrollbar        { width: 3px; }
+  .gd-book-list::-webkit-scrollbar-track  { background: transparent; }
+  .gd-book-list::-webkit-scrollbar-thumb  { background: rgba(255,255,255,.12); border-radius: 2px; }
+
+  .gd-book-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+  }
+  .gd-book-row:last-child { border-bottom: none; }
+  .gd-upload-icon { width: 20px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
+  .gd-book-title  { flex: 1; font-size: 13px; color: #ddddf0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .gd-no-books    { color: #555570; font-size: 12px; padding: 16px 0; text-align: center; }
+
+  /* Green iOS-style toggle */
+  .gd-toggle { position: relative; width: 44px; height: 24px; flex-shrink: 0; cursor: pointer; }
+  .gd-toggle input { opacity: 0; width: 0; height: 0; position: absolute; }
+  .gd-toggle-slider {
+    position: absolute; inset: 0; border-radius: 12px;
+    background: #2a2a3e; transition: background .2s; cursor: pointer;
+  }
+  .gd-toggle input:checked + .gd-toggle-slider { background: #16a34a; }
+  .gd-toggle-slider::after {
+    content: ''; position: absolute; width: 18px; height: 18px;
+    background: #fff; border-radius: 50%; top: 3px; left: 3px;
+    transition: transform .2s; box-shadow: 0 1px 4px rgba(0,0,0,.5);
+  }
+  .gd-toggle input:checked + .gd-toggle-slider::after { transform: translateX(20px); }
+
+  /* ③ Export card */
+  .gd-export-card { padding: 13px 14px; }
+  .gd-export-header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 10px;
+  }
+  .gd-export-label { font-size: 13px; font-weight: 600; color: #ddddf0; }
+  .gd-export-btn {
+    display: flex; align-items: center; gap: 5px;
+    background: #166534; color: #d1fae5;
+    border: 1px solid #15803d; border-radius: 20px;
+    padding: 5px 13px; font-size: 11px; font-weight: 700;
+    letter-spacing: .06em; cursor: pointer; transition: background .15s;
+    white-space: nowrap;
+  }
+  .gd-export-btn:hover    { background: #14532d; }
+  .gd-export-btn:disabled { opacity: .5; cursor: not-allowed; }
+
+  .gd-field { margin-bottom: 9px; }
+  .gd-field label { font-size: 11px; color: #7070a0; display: block; margin-bottom: 4px; }
+  .gd-field select,
+  .gd-field input {
+    width: 100%; background: rgba(255,255,255,0.92); color: #111;
+    border: none; border-radius: 7px; padding: 7px 10px; font-size: 13px;
+    appearance: none; -webkit-appearance: none;
+  }
+  .gd-field select {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23555'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 10px center;
+    padding-right: 28px;
+  }
+  #gd-export-msg { font-size: 12px; margin-top: 6px; min-height: 16px; }
+
+  /* ④ Amber import button */
+  .gd-btn-import {
+    width: 100%; padding: 12px 16px;
+    background: linear-gradient(90deg, #b45309, #f59e0b);
+    color: #fff; font-size: 14px; font-weight: 700;
+    border: none; border-radius: 12px; cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    transition: filter .15s;
+  }
+  .gd-btn-import:hover { filter: brightness(1.08); }
+
+  /* ⑤ Inline import file picker */
+  .gd-import-panel {
+    border: 2px solid #d97706;
+    border-radius: 14px;
+    background: #08080f;
+    min-height: 115px;
+    max-height: 200px;
+    overflow-y: auto;
+    padding: 10px 12px;
+    animation: gdExpand .2s ease;
+  }
+  @keyframes gdExpand {
+    from { opacity: 0; transform: translateY(-5px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .gd-import-placeholder {
+    display: flex; align-items: center; justify-content: center;
+    height: 80px;
+    color: rgba(255,255,255,0.11); font-size: 13px; font-weight: 600;
+    transform: rotate(-14deg); pointer-events: none; user-select: none;
+  }
+  .gd-import-file {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 4px; border-bottom: 1px solid rgba(255,255,255,0.05);
+    cursor: pointer; border-radius: 6px; transition: background .1s;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .gd-import-file:last-child { border-bottom: none; }
+  .gd-import-file:hover  { background: rgba(255,255,255,0.04); }
+  .gd-import-fname {
+    flex: 1; font-size: 12px; color: #ddddf0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .gd-badge-on-device {
+    font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 5px;
+    background: rgba(34, 197, 94, 0.14); color: #4ade80; white-space: nowrap; flex-shrink: 0;
+  }
+  .gd-badge-import {
+    font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 5px;
+    background: rgba(99, 102, 241, 0.14); color: #818cf8; white-space: nowrap; flex-shrink: 0;
+  }
+  .gd-import-state { text-align: center; padding: 22px 0; font-size: 12px; color: #555570; }
+  .gd-import-error { color: #f87171; font-size: 12px; padding: 10px 0; }
+
+  /* ⑥ Bottom row */
+  .gd-bottom-row { display: flex; gap: 8px; }
+  .gd-btn-sync {
+    flex: 1; padding: 11px 0;
+    background: #1d4ed8; color: #fff;
+    border: none; border-radius: 12px;
+    font-size: 13px; font-weight: 700; cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    transition: filter .15s;
+  }
+  .gd-btn-sync:hover    { filter: brightness(1.12); }
+  .gd-btn-sync:disabled { opacity: .55; cursor: not-allowed; filter: none; }
+  .gd-btn-disconnect {
+    flex: 1; padding: 11px 0;
+    background: #b91c1c; color: #fff;
+    border: none; border-radius: 12px;
+    font-size: 13px; font-weight: 700; cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    transition: filter .15s;
+  }
+  .gd-btn-disconnect:hover { filter: brightness(1.12); }
+
+  /* ⑦ Sync progress bar — slides up from beneath the bottom row */
+  .gd-sync-progress-wrap {
+    overflow: hidden;
+    max-height: 0;
+    opacity: 0;
+    transition: max-height .3s cubic-bezier(.4,0,.2,1), opacity .25s ease;
+  }
+  .gd-sync-progress-wrap.visible {
+    max-height: 34px;
+    opacity: 1;
+  }
+  .gd-sync-progress-inner {
+    background: rgba(36, 36, 52, 0.70);
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 8px;
+    height: 26px;
+    margin-top: 2px;
+    overflow: hidden;
+    position: relative;
+  }
+  .gd-sync-bar {
+    height: 100%; width: 0%;
+    background: linear-gradient(90deg, #1d4ed8, #6366f1, #818cf8);
+    border-radius: 8px;
+    transition: width .4s ease;
+  }
+  .gd-sync-label {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 10px; font-weight: 600; color: rgba(255,255,255,0.65);
+    letter-spacing: .04em; pointer-events: none;
+  }
+`);
 
 function getAPI() { return window.CloudBackupAPI; }
 
-// ── Progress bar ──────────────────────────────────────────────────────────────
+// ── HTML escape utility ───────────────────────────────────────────────────────
+function esc(s) {
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// ── Shared top progress bar ───────────────────────────────────────────────────
 
 const progressWrap = document.createElement('div');
 progressWrap.className = 'progress-bar-wrap';
@@ -153,8 +394,7 @@ function startProgressPoll() {
     try {
       const raw = await getAPI().storage.get('syncProgress');
       if (!raw) return;
-      const ev = JSON.parse(raw);
-      updateProgressBar(ev);
+      updateProgressBar(JSON.parse(raw));
     } catch {}
   }, 1500);
 }
@@ -167,26 +407,18 @@ function updateProgressBar(ev) {
   const pb = document.getElementById('pb');
   const pl = document.getElementById('pl');
   if (!pb || !pl) return;
-
   if (ev.phase === 'done' || ev.phase === 'offline') {
-    pb.style.opacity = '0';
-    pl.style.display = 'none';
-    return;
+    pb.style.opacity = '0'; pl.style.display = 'none'; return;
   }
-
   const pct = ev.total > 0 ? Math.round((ev.current / ev.total) * 100) : 30;
-  pb.style.width  = pct + '%';
-  pb.style.opacity = '1';
-  pl.style.display = 'block';
-
+  pb.style.width = pct + '%'; pb.style.opacity = '1'; pl.style.display = 'block';
   const phaseText = {
     checking:    `Checking ${ev.sessionTitle ?? ''}…`,
     downloading: `Downloading ${ev.sessionTitle ?? ''}…`,
     error:       `Error: ${ev.error ?? 'sync failed'}`,
   };
   pl.textContent = phaseText[ev.phase] ?? ev.phase;
-  if (ev.phase === 'error') { pb.style.background = '#ef4444'; }
-  else { pb.style.background = '#6366f1'; }
+  pb.style.background = ev.phase === 'error' ? '#ef4444' : '#6366f1';
 }
 
 // ── Root container ────────────────────────────────────────────────────────────
@@ -194,7 +426,9 @@ const root = document.createElement('div');
 root.id = 'app';
 document.body.appendChild(root);
 
-// ── Screens ───────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+//  PROVIDER PICKER
+// ═════════════════════════════════════════════════════════════════════════════
 
 function renderProviderPicker() {
   stopProgressPoll();
@@ -222,6 +456,10 @@ function renderProviderPicker() {
     });
   });
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  WEBDAV FORM
+// ═════════════════════════════════════════════════════════════════════════════
 
 function renderWebDAVForm() {
   root.innerHTML = `<div class="page">
@@ -276,11 +514,12 @@ function renderWebDAVForm() {
   });
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+//  OAUTH CONNECT (shared — routes to correct view on success)
+// ═════════════════════════════════════════════════════════════════════════════
+
 function renderOAuthConnect(providerKey) {
   const p = PROVIDERS.find(p => p.key === providerKey);
-
-  // Google Drive uses the native Credential Manager bottom-sheet (no browser).
-  // All other OAuth providers (Dropbox) use the PKCE browser flow.
   const isNativeAuth = providerKey === 'gdrive';
 
   const subText = isNativeAuth
@@ -288,8 +527,6 @@ function renderOAuthConnect(providerKey) {
        Files will be saved in a folder named <strong>AuthNo</strong> — nothing else is accessed.`
     : `You'll be taken to ${p.label} to authorise Authno.<br>
        Files will be saved in a folder named <strong>AuthNo</strong> — nothing else is accessed.`;
-
-  const connectingText = isNativeAuth ? 'Signing in…' : 'Opening browser…';
 
   root.innerHTML = `<div class="page">
     <h1>${p.label}</h1>
@@ -304,10 +541,13 @@ function renderOAuthConnect(providerKey) {
   document.getElementById('oauth-back').addEventListener('click', renderProviderPicker);
   document.getElementById('oauth-go').addEventListener('click', async () => {
     const btn = document.getElementById('oauth-go');
-    btn.textContent = connectingText; btn.disabled = true;
+    btn.textContent = isNativeAuth ? 'Signing in…' : 'Opening browser…';
+    btn.disabled = true;
     try {
       await getAPI().connectProvider(providerKey, {});
-      await renderConnectedView();
+      // Route: Google Drive gets the new view; everything else gets the old one
+      if (providerKey === 'gdrive') await renderGDriveView();
+      else await renderConnectedView();
     } catch (e) {
       const errEl = document.getElementById('oauth-err');
       if (errEl) { errEl.className = 'err-banner'; errEl.textContent = e.message; }
@@ -316,17 +556,19 @@ function renderOAuthConnect(providerKey) {
   });
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+//  DROPBOX / WEBDAV CONNECTED VIEW  (unchanged from v1.3.2)
+// ═════════════════════════════════════════════════════════════════════════════
+
 async function renderConnectedView() {
   const API = getAPI();
   const { activeProvider, tileStatus, queueEntries } = await API.getStatus();
   const p = PROVIDERS.find(p => p.key === activeProvider) ?? { label: activeProvider ?? 'Cloud', svg: '☁️' };
   const dotClass = `dot-${tileStatus}`;
-
   const sessions = (await API.getSessions()) ?? [];
 
   root.innerHTML = `<div class="page">
 
-    <!-- Status card -->
     <div class="card">
       <div style="display:flex;align-items:center;justify-content:space-between">
         <div style="display:flex;align-items:center;gap:10px">
@@ -348,7 +590,6 @@ async function renderConnectedView() {
       </div>
     </div>
 
-    <!-- Upload queue -->
     ${queueEntries.length > 0 ? `
     <div class="card">
       <h2>Upload queue (${queueEntries.length})</h2>
@@ -362,28 +603,24 @@ async function renderConnectedView() {
         </div>`).join('')}
     </div>` : ''}
 
-    <!-- Feature A: Export to cloud -->
     <div class="card">
       <h2>Export to cloud</h2>
       <div id="export-session-picker">
         <div class="field"><label>Book</label>
           <select id="export-session">
             ${sessions.map(s => `<option value="${s.id}">${s.title || 'Untitled'}</option>`).join('')}
-          </select>
-        </div>
+          </select></div>
         <div class="field"><label>Format</label>
           <select id="export-format">
             <option value="txt">Plain text (.txt)</option>
             <option value="html">HTML (.html)</option>
             <option value="epub">EPUB (.epub)</option>
-          </select>
-        </div>
+          </select></div>
         <button class="btn btn-primary" id="btn-export" style="width:100%">Export to ${p.label}</button>
         <div id="export-msg" style="margin-top:8px;font-size:12px"></div>
       </div>
     </div>
 
-    <!-- Feature C: Per-book backup toggles -->
     <div class="card">
       <h2>Per-book backup</h2>
       <div id="book-toggles">Loading…</div>
@@ -405,55 +642,38 @@ async function renderConnectedView() {
   document.getElementById('btn-sync-now')?.addEventListener('click', async () => {
     const btn = document.getElementById('btn-sync-now');
     btn.textContent = 'Syncing…'; btn.disabled = true;
-    try {
-      await API.syncNow();
-    } catch (e) {
-      console.error('[cloud-backup] syncNow error:', e);
-    } finally {
-      btn.textContent = '↻ Sync now'; btn.disabled = false;
-      await renderConnectedView();
-    }
+    try { await API.syncNow(); } catch (e) { console.error('[cloud-backup] syncNow error:', e); }
+    finally { btn.textContent = '↻ Sync now'; btn.disabled = false; await renderConnectedView(); }
   });
 
   document.getElementById('btn-import')?.addEventListener('click', () => {
     API.navigate(API.extension, 'cloud-files', null);
   });
 
-  // Feature A: export handler
   document.getElementById('btn-export')?.addEventListener('click', async () => {
     const sessionId = document.getElementById('export-session').value;
     const format    = document.getElementById('export-format').value;
     const msg       = document.getElementById('export-msg');
     const btn       = document.getElementById('btn-export');
     btn.textContent = 'Exporting…'; btn.disabled = true; msg.textContent = '';
-
     try {
       const session = sessions.find(s => s.id === sessionId);
       if (!session) throw new Error('Session not found');
-
       const exported = await API.exportSessionAs(session, format);
       if (!exported?.base64) throw new Error('Export returned no data');
-
-      // Upload the exported file using the provider's raw upload-bytes method
       const credsRaw = await API.storage.get(`creds:${activeProvider}`);
-      const creds    = JSON.parse(credsRaw);
+      const creds = JSON.parse(credsRaw);
       const provider = API.providers[activeProvider];
-
-      // For export we create a fake entry with the exported filename
       const fname = exported.filename ?? `${session.title || 'book'}.${format}`;
       await provider.uploadRaw(fname, exported.base64, creds);
-
-      msg.style.color = '#22c55e';
-      msg.textContent = `✓ Exported ${fname} to ${p.label}`;
+      msg.style.color = '#22c55e'; msg.textContent = `✓ Exported ${fname} to ${p.label}`;
     } catch (e) {
-      msg.style.color = '#ef4444';
-      msg.textContent = e.message;
+      msg.style.color = '#ef4444'; msg.textContent = e.message;
     } finally {
       btn.textContent = `Export to ${p.label}`; btn.disabled = false;
     }
   });
 
-  // Feature C: render per-book toggles
   const togglesEl = document.getElementById('book-toggles');
   if (togglesEl) {
     if (!sessions.length) {
@@ -480,19 +700,315 @@ async function renderConnectedView() {
 
   window.toggleBook = async (sessionId, disable) => {
     await API.setBookBackupDisabled(sessionId, disable);
-    // Update subtitle
     const row = document.querySelector(`[onchange*="${sessionId}"]`)?.closest('.toggle-row');
     if (row) row.querySelector('.toggle-sub').textContent = disable ? 'Not backed up' : 'Auto-backup on';
   };
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+//  GOOGLE DRIVE — BESPOKE CONNECTED VIEW
+// ═════════════════════════════════════════════════════════════════════════════
+
+async function renderGDriveView() {
+  const API = getAPI();
+  const { activeProvider, tileStatus, queueEntries } = await API.getStatus();
+  const sessions = (await API.getSessions()) ?? [];
+
+  // Books with queue and toggle state
+  const queueIds = new Set((queueEntries ?? []).map(e => e.sessionId));
+  const bookData = await Promise.all(sessions.map(async s => ({
+    id:      s.id,
+    title:   s.title || 'Untitled',
+    disabled: await API.isBookBackupDisabled(s.id),
+    queued:  queueIds.has(s.id),
+  })));
+
+  const circleClass = tileStatus === 'syncing' ? 'syncing'
+                    : tileStatus === 'error'   ? 'error'
+                    : '';
+  const statusText  = tileStatus === 'synced'  ? 'All Selected Books Backed Up'
+                    : tileStatus === 'syncing' ? 'Syncing…'
+                    : 'Sync Error — tap Sync Now to retry';
+
+  // SVGs defined inline so no external dependencies
+  const uploadSVG = `<svg xmlns="http://www.w3.org/2000/svg" width="15" height="15"
+    viewBox="0 0 24 24" fill="none" stroke="#8888bb" stroke-width="2.2"
+    stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="16 16 12 12 8 16"/>
+    <line x1="12" y1="12" x2="12" y2="21"/>
+    <path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/>
+  </svg>`;
+
+  const leafSVG = `<svg xmlns="http://www.w3.org/2000/svg" width="11" height="11"
+    viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+    stroke-linecap="round" stroke-linejoin="round">
+    <path d="M11 20A7 7 0 0 1 9.8 6.1C15.5 5 17 4.48 19 2c1 2 2 4.18 2 8 0 5.5-4.78 10-10 10z"/>
+    <path d="M2 21c0-3 1.85-5.36 5.08-6 3.23-.64 6.8-2 9.2-5.09"/>
+  </svg>`;
+
+  const gDriveSVG = PROVIDERS.find(p => p.key === 'gdrive')?.svg ?? '';
+
+  const bookRowsHtml = bookData.length === 0
+    ? `<div class="gd-no-books">No books yet.</div>`
+    : bookData.map(b => `
+        <div class="gd-book-row">
+          <span class="gd-upload-icon">${b.queued ? uploadSVG : ''}</span>
+          <span class="gd-book-title">${esc(b.title)}</span>
+          <label class="gd-toggle" title="${b.disabled ? 'Backup off' : 'Backup on'}">
+            <input type="checkbox" ${b.disabled ? '' : 'checked'}
+              onchange="gdToggleBook('${esc(b.id)}', !this.checked)">
+            <span class="gd-toggle-slider"></span>
+          </label>
+        </div>`).join('');
+
+  root.innerHTML = `<div class="gd-screen">
+
+    <!-- ① Header -->
+    <div class="gd-tile gd-header">
+      <div class="gd-provider-info">
+        ${gDriveSVG}
+        <div>
+          <div class="gd-provider-name">Google Drive</div>
+          <div class="gd-provider-sub">${esc(statusText)}</div>
+        </div>
+      </div>
+      <div class="gd-status-circle ${circleClass}"></div>
+    </div>
+
+    <!-- ② Book list (frosted glass, scrollable) -->
+    <div class="gd-tile gd-book-list">
+      ${bookRowsHtml}
+    </div>
+
+    <!-- ③ Export card -->
+    <div class="gd-tile gd-export-card">
+      <div class="gd-export-header">
+        <span class="gd-export-label">Export to Cloud</span>
+        <button class="gd-export-btn" id="gd-btn-export">
+          ${leafSVG} EXPORT
+        </button>
+      </div>
+      <div class="gd-field">
+        <label>Book</label>
+        <select id="gd-export-session">
+          ${sessions.length
+            ? sessions.map(s => `<option value="${esc(s.id)}">${esc(s.title || 'Untitled')}</option>`).join('')
+            : `<option disabled selected>No books</option>`}
+        </select>
+      </div>
+      <div class="gd-field">
+        <label>Format</label>
+        <select id="gd-export-format">
+          <option value="txt">Plain text (.txt)</option>
+          <option value="html">HTML (.html)</option>
+          <option value="epub">EPUB (.epub)</option>
+        </select>
+      </div>
+      <div id="gd-export-msg"></div>
+    </div>
+
+    <!-- ④ Import button -->
+    <button class="gd-btn-import" id="gd-btn-import">Import from Cloud</button>
+
+    <!-- ⑤ Inline file picker (toggled by the button above) -->
+    <div class="gd-import-panel hidden" id="gd-import-panel">
+      <div class="gd-import-placeholder">Files and Folders in Cloud</div>
+    </div>
+
+    <!-- ⑥ Sync / Disconnect -->
+    <div class="gd-bottom-row">
+      <button class="gd-btn-sync" id="gd-btn-sync">Sync Now</button>
+      <button class="gd-btn-disconnect" id="gd-btn-disconnect">Disconnect</button>
+    </div>
+
+    <!-- ⑦ Progress bar — slides up from beneath the buttons -->
+    <div class="gd-sync-progress-wrap" id="gd-sync-progress-wrap">
+      <div class="gd-sync-progress-inner">
+        <div class="gd-sync-bar" id="gd-sync-bar"></div>
+        <div class="gd-sync-label" id="gd-sync-label">Syncing…</div>
+      </div>
+    </div>
+
+  </div>`;
+
+  startProgressPoll();
+
+  // ── Disconnect ────────────────────────────────────────────────────────────
+  document.getElementById('gd-btn-disconnect')?.addEventListener('click', async () => {
+    stopProgressPoll();
+    await API.disconnectProvider();
+    renderProviderPicker();
+  });
+
+  // ── Sync Now ──────────────────────────────────────────────────────────────
+  document.getElementById('gd-btn-sync')?.addEventListener('click', async () => {
+    const btn  = document.getElementById('gd-btn-sync');
+    const wrap = document.getElementById('gd-sync-progress-wrap');
+    const bar  = document.getElementById('gd-sync-bar');
+    const lbl  = document.getElementById('gd-sync-label');
+
+    btn.textContent = 'Syncing…';
+    btn.disabled    = true;
+    wrap?.classList.add('visible');
+
+    // Fake-advance bar to 85% while the real sync runs
+    let pct = 0;
+    const ticker = setInterval(() => {
+      pct = Math.min(pct + 7, 85);
+      if (bar) bar.style.width = pct + '%';
+    }, 300);
+
+    try {
+      await API.syncNow();
+      if (lbl) lbl.textContent = 'Sync complete ✓';
+    } catch (e) {
+      console.error('[cloud-backup] syncNow error:', e);
+      if (lbl) lbl.textContent = 'Sync failed';
+      if (bar) bar.style.background = '#ef4444';
+    } finally {
+      clearInterval(ticker);
+      if (bar) bar.style.width = '100%';
+      setTimeout(async () => {
+        wrap?.classList.remove('visible');
+        await renderGDriveView(); // re-render to pick up new tileStatus / queue
+      }, 750);
+    }
+  });
+
+  // ── Import from Cloud ─────────────────────────────────────────────────────
+  document.getElementById('gd-btn-import')?.addEventListener('click', () => {
+    const panel = document.getElementById('gd-import-panel');
+    if (!panel) return;
+    const isOpen = !panel.classList.contains('hidden');
+    if (isOpen) {
+      panel.classList.add('hidden');
+      return;
+    }
+    panel.classList.remove('hidden');
+    _gdLoadImportPanel(panel);
+  });
+
+  // ── Export ────────────────────────────────────────────────────────────────
+  document.getElementById('gd-btn-export')?.addEventListener('click', async () => {
+    const sessionId = document.getElementById('gd-export-session')?.value;
+    const format    = document.getElementById('gd-export-format')?.value ?? 'txt';
+    const msg       = document.getElementById('gd-export-msg');
+    const btn       = document.getElementById('gd-btn-export');
+    if (!sessionId) return;
+
+    btn.innerHTML = `${leafSVG} Exporting…`;
+    btn.disabled  = true;
+    if (msg) msg.textContent = '';
+
+    try {
+      const session = sessions.find(s => s.id === sessionId);
+      if (!session) throw new Error('Session not found');
+      const exported = await API.exportSessionAs(session, format);
+      if (!exported?.base64) throw new Error('Export returned no data');
+      const credsRaw = await API.storage.get(`creds:${activeProvider}`);
+      const creds = JSON.parse(credsRaw);
+      const provider = API.providers[activeProvider];
+      const fname = exported.filename ?? `${session.title || 'book'}.${format}`;
+      await provider.uploadRaw(fname, exported.base64, creds);
+      if (msg) { msg.style.color = '#4ade80'; msg.textContent = `✓ Exported ${fname}`; }
+    } catch (e) {
+      if (msg) { msg.style.color = '#f87171'; msg.textContent = e.message; }
+    } finally {
+      btn.innerHTML = `${leafSVG} EXPORT`;
+      btn.disabled  = false;
+    }
+  });
+
+  // ── Per-book toggle (inline onchange) ────────────────────────────────────
+  window.gdToggleBook = async (sessionId, disable) => {
+    await API.setBookBackupDisabled(sessionId, disable);
+  };
+}
+
+// ── Import panel: load real file list from Drive ──────────────────────────────
+
+async function _gdLoadImportPanel(panel) {
+  panel.innerHTML = `<div class="gd-import-state">Loading…</div>`;
+  try {
+    const API = getAPI();
+    const { activeProvider } = await API.getStatus();
+    const credsRaw = await API.storage.get(`creds:${activeProvider}`);
+    if (!credsRaw) throw new Error('Not authenticated');
+    const creds    = JSON.parse(credsRaw);
+    const provider = API.providers[activeProvider];
+    if (!provider?.listFiles) throw new Error('listFiles not supported');
+
+    const files         = await provider.listFiles(creds);
+    const localSessions = (await API.getSessions()) ?? [];
+
+    if (!files.length) {
+      panel.innerHTML = `<div class="gd-import-state">No .authbook files found in your AuthNo folder.</div>`;
+      return;
+    }
+
+    function fmtDate(iso) {
+      if (!iso) return '';
+      return new Date(iso).toLocaleDateString(undefined,
+        { month: 'short', day: 'numeric', year: 'numeric' });
+    }
+
+    panel.innerHTML = files.map(f => {
+      const onDevice    = localSessions.some(s => s.id === f.sessionId);
+      const displayName = f.name.replace(/^authno_/, '').replace(/\.authbook$/, '') || f.name;
+      const dateTxt     = fmtDate(f.modifiedTime);
+      return `<div class="gd-import-file"
+          data-sid="${esc(f.sessionId)}"
+          onclick="gdImportFile('${esc(f.sessionId)}','${esc(displayName)}')">
+        <span>📖</span>
+        <span class="gd-import-fname">
+          ${esc(displayName)}
+          ${dateTxt ? `<span style="color:#4a4a68;font-size:10px;margin-left:5px">${esc(dateTxt)}</span>` : ''}
+        </span>
+        <span class="${onDevice ? 'gd-badge-on-device' : 'gd-badge-import'}">
+          ${onDevice ? '✓ On device' : 'Import'}
+        </span>
+      </div>`;
+    }).join('');
+  } catch (e) {
+    panel.innerHTML = `<div class="gd-import-error">${esc(e.message)}</div>`;
+  }
+}
+
+// Global called from inline onclick in the file list
+window.gdImportFile = async (sessionId, displayName) => {
+  const API   = getAPI();
+  const panel = document.getElementById('gd-import-panel');
+  const row   = panel?.querySelector(`[data-sid="${CSS.escape(sessionId)}"]`);
+  const badge = row?.querySelector('[class^="gd-badge"]');
+
+  if (badge) badge.textContent = '…';
+
+  try {
+    const { activeProvider } = await API.getStatus();
+    const credsRaw           = await API.storage.get(`creds:${activeProvider}`);
+    const creds              = JSON.parse(credsRaw);
+    const provider           = API.providers[activeProvider];
+    const { base64 }         = await provider.download(sessionId, creds);
+    await API.importSession(base64);
+    if (badge) { badge.className = 'gd-badge-on-device'; badge.textContent = '✓ On device'; }
+  } catch (e) {
+    console.error('[cloud-backup] gdImportFile failed:', e);
+    if (badge) { badge.style.color = '#f87171'; badge.textContent = 'Failed'; }
+  }
+};
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  INIT
+// ═════════════════════════════════════════════════════════════════════════════
+
 (async () => {
   try {
     const { activeProvider } = await getAPI().getStatus();
-    if (activeProvider) await renderConnectedView();
-    else renderProviderPicker();
+    if (activeProvider === 'gdrive') await renderGDriveView();
+    else if (activeProvider)         await renderConnectedView();
+    else                             renderProviderPicker();
   } catch (e) {
     document.body.innerHTML += `<div style="padding:24px;color:#ef4444;font-size:13px">
-      Failed to load: ${e.message}</div>`;
+      Failed to load: ${esc(e.message)}</div>`;
   }
 })();
