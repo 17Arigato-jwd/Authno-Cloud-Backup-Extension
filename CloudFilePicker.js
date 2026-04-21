@@ -99,14 +99,15 @@ const root = document.body;
 
     localSessions = (await API.getSessions()) ?? [];
 
-    const providers = API.providers;
-    const provider  = providers[activeProvider];
+    // Use refreshCreds so an expired token is silently refreshed and saved back
+    // before we hit listFiles. This is the root cause of "import doesn't work"
+    // when a session has been idle and the token has expired.
+    const provider = API.providers[activeProvider];
     if (!provider?.listFiles) throw new Error('listFiles not supported by this provider');
 
-    // Load creds via storage bridge
-    const credsRaw = await API.storage.get(`creds:${activeProvider}`);
-    if (!credsRaw) throw new Error('Not authenticated');
-    const creds = JSON.parse(credsRaw);
+    // Load creds via refreshCreds (saves refreshed token back to storage)
+    const creds = await provider.refreshCreds(API.storage);
+    if (!creds) throw new Error('Not authenticated');
 
     files = await provider.listFiles(creds);
     renderList();
@@ -151,10 +152,11 @@ function renderList() {
 
   const rows = files.map(f => {
     const onDevice = isOnDevice(f.sessionId);
+    const label    = f.displayName || f.name.replace(/^authno_/, '').replace(/\.authbook$/, '') || f.name;
     return `<div class="file-row" onclick="selectFile('${f.sessionId}')">
       <div class="file-icon">📖</div>
       <div class="file-info">
-        <div class="file-name">${esc(f.name.replace(/^authno_/, '').replace(/\.authbook$/, '') || f.name)}</div>
+        <div class="file-name">${esc(label)}</div>
         <div class="file-meta">${fmtDate(f.modifiedTime)}${f.size ? ' · ' + fmtBytes(f.size) : ''}</div>
       </div>
       <span class="${onDevice ? 'badge-local' : 'badge-import'}">${onDevice ? '✓ On device' : 'Import'}</span>
@@ -172,8 +174,8 @@ function renderList() {
 function renderConfirmSheet() {
   const f = files.find(f => f.sessionId === selectedFile);
   if (!f) return;
-  const onDevice = isOnDevice(f.sessionId);
-  const displayName = f.name.replace(/^authno_/, '').replace(/\.authbook$/, '') || f.name;
+  const onDevice    = isOnDevice(f.sessionId);
+  const displayName = f.displayName || f.name.replace(/^authno_/, '').replace(/\.authbook$/, '') || f.name;
 
   const sheet = document.createElement('div');
   sheet.className = 'sheet-overlay';
@@ -199,10 +201,16 @@ async function confirmImport() {
 
   try {
     const { activeProvider } = await API.getStatus();
-    const provider  = API.providers[activeProvider];
-    const credsRaw  = await API.storage.get(`creds:${activeProvider}`);
-    const creds     = JSON.parse(credsRaw);
-    const { base64 } = await provider.download(selectedFile, creds);
+    const provider = API.providers[activeProvider];
+
+    // Use refreshCreds so an expired token is refreshed and saved before download
+    const creds = await provider.refreshCreds(API.storage);
+    if (!creds) throw new Error('Not authenticated');
+
+    // Pass the actual cloud path when available (fixes Dropbox import path mismatch)
+    const f          = files.find(f => f.sessionId === selectedFile);
+    const downloadId = f?.dropboxPath ?? selectedFile;
+    const { base64 } = await provider.download(downloadId, creds);
     await API.importSession(base64);
 
     dismissSheet();

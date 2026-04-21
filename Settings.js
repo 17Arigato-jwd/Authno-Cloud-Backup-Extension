@@ -149,6 +149,7 @@ document.head.insertAdjacentHTML('beforeend', `<style>
     display: flex;
     flex-direction: column;
     gap: 10px;
+    position: relative;
   }
 
   /* ① Header */
@@ -173,10 +174,11 @@ document.head.insertAdjacentHTML('beforeend', `<style>
     box-shadow: 0 0 10px rgba(74, 222, 128, 0.28);
   }
   .gd-status-circle.syncing {
-    background: radial-gradient(circle at 28% 50%, #78350f 0%, #fbbf24 100%);
+    background: conic-gradient(#14532d 0%, #4ade80 40%, #fbbf24 70%, #78350f 100%);
     box-shadow: 0 0 10px rgba(251, 191, 36, 0.28);
-    animation: pulse 1.2s ease-in-out infinite;
+    animation: gdSpin 1.1s linear infinite;
   }
+  @keyframes gdSpin { to { transform: rotate(360deg); } }
   .gd-status-circle.error {
     background: radial-gradient(circle at 28% 50%, #7f1d1d 0%, #f87171 100%);
     box-shadow: 0 0 10px rgba(248, 113, 113, 0.28);
@@ -362,6 +364,19 @@ document.head.insertAdjacentHTML('beforeend', `<style>
     font-size: 10px; font-weight: 600; color: rgba(255,255,255,0.65);
     letter-spacing: .04em; pointer-events: none;
   }
+
+  /* ── .extbk import corner button (shared by GDrive + generic views) ─────── */
+  .extbk-btn {
+    position: absolute; top: 10px; right: 10px;
+    display: flex; align-items: center; gap: 4px;
+    background: rgba(30,30,44,0.85); border: 1px solid rgba(255,255,255,0.10);
+    color: #9090b8; border-radius: 20px; padding: 4px 10px 4px 7px;
+    font-size: 10px; font-weight: 600; letter-spacing: .03em;
+    cursor: pointer; transition: color .15s, border-color .15s;
+    -webkit-tap-highlight-color: transparent; z-index: 5;
+  }
+  .extbk-btn:hover { color: #c0c0f0; border-color: rgba(255,255,255,0.22); }
+  .extbk-btn svg  { flex-shrink: 0; }
 `);
 
 function getAPI() { return window.CloudBackupAPI; }
@@ -567,7 +582,17 @@ async function renderConnectedView() {
   const dotClass = `dot-${tileStatus}`;
   const sessions = (await API.getSessions()) ?? [];
 
-  root.innerHTML = `<div class="page">
+  root.innerHTML = `<div class="page" style="position:relative">
+
+    <!-- .extbk import corner button -->
+    <button class="extbk-btn" id="btn-extbk" title="Import extension backup (.extbk)">
+      <svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24"
+        fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+        <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+      </svg>
+      .extbk
+    </button>
 
     <div class="card">
       <div style="display:flex;align-items:center;justify-content:space-between">
@@ -632,6 +657,10 @@ async function renderConnectedView() {
   </div>`;
 
   startProgressPoll();
+
+  document.getElementById('btn-extbk')?.addEventListener('click', () => {
+    _promptExtbkImport(activeProvider);
+  });
 
   document.getElementById('btn-disconnect')?.addEventListener('click', async () => {
     stopProgressPoll();
@@ -763,6 +792,16 @@ async function renderGDriveView() {
 
   root.innerHTML = `<div class="gd-screen">
 
+    <!-- .extbk import corner button -->
+    <button class="extbk-btn" id="gd-btn-extbk" title="Import extension backup (.extbk)">
+      <svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24"
+        fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+        <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+      </svg>
+      .extbk
+    </button>
+
     <!-- ① Header -->
     <div class="gd-tile gd-header">
       <div class="gd-provider-info">
@@ -832,6 +871,11 @@ async function renderGDriveView() {
   </div>`;
 
   startProgressPoll();
+
+  // ── .extbk import ────────────────────────────────────────────────────────
+  document.getElementById('gd-btn-extbk')?.addEventListener('click', () => {
+    _promptExtbkImport(activeProvider);
+  });
 
   // ── Disconnect ────────────────────────────────────────────────────────────
   document.getElementById('gd-btn-disconnect')?.addEventListener('click', async () => {
@@ -932,11 +976,12 @@ async function _gdLoadImportPanel(panel) {
   try {
     const API = getAPI();
     const { activeProvider } = await API.getStatus();
-    const credsRaw = await API.storage.get(`creds:${activeProvider}`);
-    if (!credsRaw) throw new Error('Not authenticated');
-    const creds    = JSON.parse(credsRaw);
     const provider = API.providers[activeProvider];
     if (!provider?.listFiles) throw new Error('listFiles not supported');
+
+    // Refresh + persist token before hitting the API
+    const creds = await provider.refreshCreds(API.storage);
+    if (!creds) throw new Error('Not authenticated');
 
     const files         = await provider.listFiles(creds);
     const localSessions = (await API.getSessions()) ?? [];
@@ -946,6 +991,9 @@ async function _gdLoadImportPanel(panel) {
       return;
     }
 
+    // Stash for gdImportFile path lookup
+    panel._files = files;
+
     function fmtDate(iso) {
       if (!iso) return '';
       return new Date(iso).toLocaleDateString(undefined,
@@ -954,7 +1002,7 @@ async function _gdLoadImportPanel(panel) {
 
     panel.innerHTML = files.map(f => {
       const onDevice    = localSessions.some(s => s.id === f.sessionId);
-      const displayName = f.name.replace(/^authno_/, '').replace(/\.authbook$/, '') || f.name;
+      const displayName = f.displayName || f.name.replace(/^authno_/, '').replace(/\.authbook$/, '') || f.name;
       const dateTxt     = fmtDate(f.modifiedTime);
       return `<div class="gd-import-file"
           data-sid="${esc(f.sessionId)}"
@@ -985,10 +1033,17 @@ window.gdImportFile = async (sessionId, displayName) => {
 
   try {
     const { activeProvider } = await API.getStatus();
-    const credsRaw           = await API.storage.get(`creds:${activeProvider}`);
-    const creds              = JSON.parse(credsRaw);
     const provider           = API.providers[activeProvider];
-    const { base64 }         = await provider.download(sessionId, creds);
+
+    // Use refreshCreds so expired tokens are silently renewed and saved back
+    const creds = await provider.refreshCreds(API.storage);
+    if (!creds) throw new Error('Not authenticated');
+
+    // Prefer the actual cloud path stored on the file entry (fixes Dropbox path mismatch)
+    const fileEntry  = (panel._files ?? []).find(f => f.sessionId === sessionId);
+    const downloadId = fileEntry?.dropboxPath ?? sessionId;
+
+    const { base64 } = await provider.download(downloadId, creds);
     await API.importSession(base64);
     if (badge) { badge.className = 'gd-badge-on-device'; badge.textContent = '✓ On device'; }
   } catch (e) {
@@ -996,6 +1051,108 @@ window.gdImportFile = async (sessionId, displayName) => {
     if (badge) { badge.style.color = '#f87171'; badge.textContent = 'Failed'; }
   }
 };
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  SHARED .extbk IMPORT HELPER
+// ═════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Lists .extbk files in the cloud, shows a bottom-sheet picker, downloads
+ * the selected file, and calls API.importExtension(base64).
+ * Works for any connected provider that has listFiles().
+ */
+async function _promptExtbkImport(providerKey) {
+  const API    = getAPI();
+  const extbkSheetId = 'extbk-sheet';
+
+  // Remove any existing sheet
+  document.getElementById(extbkSheetId)?.remove();
+
+  // Build and attach the sheet skeleton immediately (shows loading state)
+  const overlay = document.createElement('div');
+  overlay.id = extbkSheetId;
+  overlay.style.cssText = `
+    position:fixed;inset:0;background:rgba(0,0,0,.6);
+    display:flex;align-items:flex-end;z-index:200;
+  `;
+  overlay.innerHTML = `
+    <div style="background:#1a1a24;border-radius:16px 16px 0 0;padding:20px 20px 36px;
+                width:100%;border-top:1px solid #2e2e3a;max-height:70vh;overflow-y:auto">
+      <div style="font-size:15px;font-weight:700;margin-bottom:4px">Import .extbk</div>
+      <div style="font-size:12px;color:#6b6b80;margin-bottom:16px">
+        Extension backup files from your AuthNo cloud folder
+      </div>
+      <div id="extbk-list" style="font-size:13px;color:#6b6b80">Loading…</div>
+      <button onclick="document.getElementById('${extbkSheetId}')?.remove()"
+        style="margin-top:14px;width:100%;padding:11px;background:#1f1f2a;
+               border:1px solid #2e2e3a;color:#e4e4f0;border-radius:10px;
+               font-size:14px;font-weight:600;cursor:pointer">
+        Cancel
+      </button>
+    </div>`;
+  document.body.appendChild(overlay);
+  // Dismiss on backdrop tap
+  overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+
+  const listEl = document.getElementById('extbk-list');
+
+  try {
+    const credsRaw = await API.storage.get(`creds:${providerKey}`);
+    if (!credsRaw) throw new Error('Not authenticated');
+    const creds    = JSON.parse(credsRaw);
+    const provider = API.providers[providerKey];
+    if (!provider?.listFiles) throw new Error('Provider does not support file listing');
+
+    const allFiles   = await provider.listFiles(creds);
+    const extbkFiles = allFiles.filter(f => f.name.endsWith('.extbk'));
+
+    if (!extbkFiles.length) {
+      listEl.textContent = 'No .extbk files found in your AuthNo folder.';
+      return;
+    }
+
+    listEl.innerHTML = extbkFiles.map((f, i) => `
+      <div style="display:flex;align-items:center;gap:10px;padding:10px 4px;
+                  border-bottom:1px solid rgba(255,255,255,0.05);cursor:pointer"
+           id="extbk-row-${i}">
+        <span>🧩</span>
+        <span style="flex:1;font-size:13px;color:#ddddf0;
+                     overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+          ${esc(f.name)}
+        </span>
+        <span id="extbk-badge-${i}"
+          style="font-size:10px;font-weight:700;padding:2px 7px;border-radius:5px;
+                 background:rgba(99,102,241,0.14);color:#818cf8;white-space:nowrap">
+          Import
+        </span>
+      </div>`).join('');
+
+    extbkFiles.forEach((f, i) => {
+      document.getElementById(`extbk-row-${i}`)?.addEventListener('click', async () => {
+        const badge = document.getElementById(`extbk-badge-${i}`);
+        if (badge) badge.textContent = '…';
+        try {
+          const freshCredsRaw = await API.storage.get(`creds:${providerKey}`);
+          const freshCreds    = JSON.parse(freshCredsRaw);
+          // download() accepts a path or sessionId; pass the raw name for extbk files
+          const { base64 } = await provider.download(f.sessionId ?? f.name, freshCreds);
+          await API.importExtension?.(base64);
+          if (badge) {
+            badge.textContent = '✓ Done';
+            badge.style.background = 'rgba(34,197,94,0.14)';
+            badge.style.color = '#4ade80';
+          }
+        } catch (e) {
+          if (badge) { badge.textContent = 'Failed'; badge.style.color = '#f87171'; }
+          console.error('[cloud-backup] extbk import failed:', e);
+        }
+      });
+    });
+
+  } catch (e) {
+    if (listEl) { listEl.style.color = '#f87171'; listEl.textContent = e.message; }
+  }
+}
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  INIT

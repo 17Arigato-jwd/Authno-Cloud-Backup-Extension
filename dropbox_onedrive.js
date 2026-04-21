@@ -236,13 +236,28 @@ export class DropboxProvider extends BaseProvider {
     } catch { return false; }
   }
 
-  _remotePath(sessionId) { return `${DROPBOX_REMOTE_ROOT}/${sessionId}.authbook`; }
+  /** Sanitise a book title for use in a Dropbox filename. */
+  _safeTitle(raw) {
+    return (raw || 'Untitled')
+      .replace(/[/\\:*?"<>|]/g, '')
+      .replace(/\s+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 60) || 'Untitled';
+  }
+
+  _remotePath(sessionId, title) {
+    // New format:  /AuthNo/{SafeTitle}_{sessionId}.authbook
+    // title is optional — falls back to old format for downloads that only know the sessionId.
+    if (title) return `${DROPBOX_REMOTE_ROOT}/${this._safeTitle(title)}_${sessionId}.authbook`;
+    return `${DROPBOX_REMOTE_ROOT}/${sessionId}.authbook`;
+  }
 
   async upload(entry, creds, base64) {
     creds = await this._refreshIfNeeded(creds);
-    const path     = this._remotePath(entry.sessionId);
-    const apiArg   = { path, mode: 'overwrite', autorename: false };
-    const bytes    = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
+    // Use readable filename: {SafeTitle}_{sessionId}.authbook
+    const path   = this._remotePath(entry.sessionId, entry.title);
+    const apiArg = { path, mode: 'overwrite', autorename: false };
+    const bytes  = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
 
     console.log(`[Dropbox] UPLOAD starting — path: ${path}, size: ${bytes.length} bytes, sessionId: ${entry.sessionId}`);
 
@@ -357,17 +372,31 @@ export class DropboxProvider extends BaseProvider {
     const { entries = [] } = await res.json();
     const filtered = entries.filter(e => e.name.endsWith('.authbook'));
     console.log(`[Dropbox] LIST_FOLDER OK — ${entries.length} entries, ${filtered.length} .authbook files`);
-    return filtered.map(e => ({
-      name: e.name,
-      sessionId: e.name.replace(/^authno_/, '').replace(/\.authbook$/, ''),
-      modifiedTime: e.server_modified,
-      size: e.size ?? 0,
-    }));
+    const uuidishRe = /^[0-9a-f\-]{8,}$/i;
+    return filtered.map(e => {
+      const withoutExt   = e.name.replace(/^authno_/, '').replace(/\.authbook$/, '');
+      const underscoreAt = withoutExt.lastIndexOf('_');
+      const lastSegment  = underscoreAt >= 0 ? withoutExt.slice(underscoreAt + 1) : '';
+      const sessionId    = (uuidishRe.test(lastSegment) && underscoreAt > 0)
+        ? lastSegment : withoutExt;
+      const displayName  = (uuidishRe.test(lastSegment) && underscoreAt > 0)
+        ? withoutExt.slice(0, underscoreAt).replace(/_/g, ' ') : withoutExt;
+      return {
+        name:        e.name,
+        displayName,
+        sessionId,
+        // Store the exact Dropbox path so download() uses the real path, not a reconstructed one.
+        dropboxPath: e.path_lower ?? `${DROPBOX_REMOTE_ROOT}/${e.name}`,
+        modifiedTime: e.server_modified,
+        size: e.size ?? 0,
+      };
+    });
   }
 
   async download(sessionId, creds) {
     creds = await this._refreshIfNeeded(creds);
-    const path = this._remotePath(sessionId);
+    // sessionId may actually be a full dropboxPath if passed from listFiles result
+    const path = sessionId.startsWith('/') ? sessionId : this._remotePath(sessionId);
     console.log(`[Dropbox] DOWNLOAD starting — path: ${path}`);
 
     const res = await fetch('https://content.dropboxapi.com/2/files/download', {

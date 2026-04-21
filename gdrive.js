@@ -113,7 +113,19 @@ export class GDriveProvider extends BaseProvider {
     return { accessToken, expiresAt: Date.now() + 3600 * 1000 };
   }
 
-  async disconnect(storage) { await this.clearCreds(storage); }
+  async disconnect(storage) {
+    // Sign out from the native GoogleDrive plugin so the next connect() call
+    // shows the account-picker UI instead of silently re-authorising the same
+    // account. This is essential for account switching.
+    try {
+      const plugin = window.Capacitor?.Plugins?.GoogleDrive;
+      if (plugin?.signOut)      await plugin.signOut();
+      else if (plugin?.revoke)  await plugin.revoke();  // older plugin API name
+    } catch (e) {
+      console.warn('[cloud-backup] gdrive signOut failed (non-fatal):', e.message);
+    }
+    await this.clearCreds(storage);
+  }
 
   async _refreshIfNeeded(creds) {
     // Token is still valid — reuse it.
@@ -172,16 +184,30 @@ export class GDriveProvider extends BaseProvider {
   }
 
   async _findFile(sessionId, folderId, creds) {
-    const name = `${sessionId}.authbook`;
-    const res  = await fetch(
+    // Search by name contains sessionId — supports both old ({sessionId}.authbook)
+    // and new ({title}_{sessionId}.authbook) filename formats.
+    const res = await fetch(
       `https://www.googleapis.com/drive/v3/files?q=` +
-      encodeURIComponent(`name='${name}' and '${folderId}' in parents and trashed=false`) +
-      `&fields=files(id,modifiedTime)`,
+      encodeURIComponent(`name contains '${sessionId}' and '${folderId}' in parents and trashed=false`) +
+      `&fields=files(id,name,modifiedTime)`,
       { headers: { Authorization: `Bearer ${creds.accessToken}` } }
     );
     if (!res.ok) return null;
     const { files } = await res.json();
-    return files?.[0] ?? null;
+    // Prefer an exact match (name ends with _{sessionId}.authbook or is {sessionId}.authbook)
+    const exact = files?.find(f =>
+      f.name === `${sessionId}.authbook` || f.name.endsWith(`_${sessionId}.authbook`)
+    );
+    return exact ?? files?.[0] ?? null;
+  }
+
+  /** Sanitise a book title for use in a filename: strip Drive-illegal chars, trim, cap length. */
+  _safeTitle(raw) {
+    return (raw || 'Untitled')
+      .replace(/[/\\:*?"<>|]/g, '')   // chars illegal in most filesystems / Drive
+      .replace(/\s+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 60) || 'Untitled';
   }
 
   // ── Upload ────────────────────────────────────────────────────────────────
@@ -202,7 +228,8 @@ export class GDriveProvider extends BaseProvider {
 
     const bytes    = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
     const boundary = '-------AuthNoUpload';
-    const name     = `${entry.sessionId}.authbook`;
+    // Human-readable filename: {SafeTitle}_{sessionId}.authbook
+    const name     = `${this._safeTitle(entry.title)}_${entry.sessionId}.authbook`;
 
     const metadata = JSON.stringify({
       name,
@@ -266,13 +293,30 @@ export class GDriveProvider extends BaseProvider {
       throw new Error(`GDrive list failed (${res.status}): ${body}`);
     }
     const { files = [] } = await res.json();
-    return files.map(f => ({
-      name:         f.name,
-      sessionId:    f.name.replace(/^authno_/, '').replace(/\.authbook$/, ''),
-      modifiedTime: f.modifiedTime,
-      size:         parseInt(f.size ?? '0', 10),
-      _fileId:      f.id,
-    }));
+    return files.map(f => {
+      // Support both old format ({sessionId}.authbook) and new ({Title}_{sessionId}.authbook)
+      const withoutExt   = f.name.replace(/^authno_/, '').replace(/\.authbook$/, '');
+      // If the stem contains an underscore followed by what looks like a UUID/timestamp,
+      // the last underscore-delimited segment is the sessionId and everything before is the title.
+      const uuidishRe    = /^[0-9a-f\-]{8,}$/i;
+      const underscoreAt = withoutExt.lastIndexOf('_');
+      const lastSegment  = underscoreAt >= 0 ? withoutExt.slice(underscoreAt + 1) : '';
+      const sessionId    = (uuidishRe.test(lastSegment) && underscoreAt > 0)
+        ? lastSegment
+        : withoutExt;   // old format — whole stem is the sessionId
+      const displayName  = (uuidishRe.test(lastSegment) && underscoreAt > 0)
+        ? withoutExt.slice(0, underscoreAt).replace(/_/g, ' ')
+        : withoutExt;
+
+      return {
+        name:         f.name,
+        displayName,
+        sessionId,
+        modifiedTime: f.modifiedTime,
+        size:         parseInt(f.size ?? '0', 10),
+        _fileId:      f.id,
+      };
+    });
   }
 
   // ── Download ──────────────────────────────────────────────────────────────

@@ -319,6 +319,12 @@ export function activate({ registerHook, storage, navigate, extension, openBrows
         );
         // ─────────────────────────────────────────────────────────────────
 
+      } else if (resolution === 'keep-local-no-upload') {
+        // User wants to keep their local version but NOT push it to cloud.
+        // Simply remove the conflicting entry from the queue so it's no
+        // longer stuck — the cloud version is left untouched.
+        await queue.removeSession(sessionId);
+
       } else if (resolution === 'use-cloud') {
         // Download the cloud version and import it into the app
         const creds = await provider.refreshCreds(storage);
