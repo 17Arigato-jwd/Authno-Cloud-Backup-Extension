@@ -1,10 +1,12 @@
+import { API } from './pageApi.js';
+
 /**
  * ui/ConflictResolution.js — v1.3.0
  *
  * Changes from v1.2.0:
  *   - Side-by-side comparison panel showing local vs cloud metadata
  *     (word count, chapter count, last-modified dates). Cloud content is
- *     fetched live; local content is read from API.getSessions().
+ *     fetched live; local numbers come from the library listing.
  *   - "Keep local version" now reveals two sub-buttons instead of resolving
  *     immediately:
  *       • "Keep local, don't update cloud" → resolveConflict(id, 'keep-local-no-upload')
@@ -95,8 +97,7 @@ document.head.insertAdjacentHTML('beforeend', `<style>
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function getAPI() { return window.CloudBackupAPI ?? null; }
-function closePage() { window.parent.postMessage({ type: 'ext-close' }, '*'); }
+function closePage() { API.close(); }
 
 function esc(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -130,26 +131,11 @@ function sessionWordCount(session) {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function init() {
-  let API = getAPI();
-  if (!API) {
-    await new Promise(res => {
-      const t = setInterval(() => {
-        if (window.CloudBackupAPI) { clearInterval(t); API = window.CloudBackupAPI; res(); }
-      }, 50);
-      setTimeout(() => { clearInterval(t); res(); }, 3000);
-    });
-  }
-
-  if (!API) {
-    document.body.innerHTML = `<div style="padding:20px;color:#ef4444">Extension API not available.</div>`;
-    return;
-  }
-
-  let ctx = {};
-  try {
-    const raw = await API.storage.get('conflictContext');
-    if (raw) ctx = JSON.parse(raw);
-  } catch {}
+  // No wait-for-the-global loop. v1 polled every 50ms for up to three seconds
+  // hoping window.CloudBackupAPI would appear, because the background half
+  // installed it whenever it happened to finish activating. The host installs
+  // `authno` before any module in this frame runs, so it is simply there.
+  const ctx = (await API.storage.getJSON('conflictContext', {})) ?? {};
 
   const { sessionId, title, cloudModified, providerName } = ctx;
   const localDate = fmtDate(new Date().toISOString());
@@ -227,8 +213,13 @@ async function init() {
         localEl.innerHTML = `<div class="compare-err">Session not found on device.</div>`;
         return;
       }
-      const wc = sessionWordCount(local);
-      const ch = local.chapters?.length ?? '?';
+      // Straight off the listing. `library.list` computes wordCount and
+      // chapterCount host-side and returns no chapter text at all, so this
+      // page shows the two numbers the choice turns on without a manuscript
+      // ever crossing into it. v1 counted the words here, which meant every
+      // chapter of the book was in this frame to be counted.
+      const wc = typeof local.wordCount === 'number' ? local.wordCount : null;
+      const ch = typeof local.chapterCount === 'number' ? local.chapterCount : '?';
       localEl.innerHTML = `
         <div class="compare-stat">
           <div class="compare-stat-label">Title</div>
@@ -254,13 +245,8 @@ async function init() {
   (async () => {
     const cloudEl = document.getElementById('cloud-stats');
     try {
-      const { activeProvider } = await API.getStatus();
-      const provider = API.providers[activeProvider];
-      const creds    = await provider.refreshCreds(API.storage);
-      if (!creds) throw new Error('Not authenticated');
-
-      // Download the cloud version to read its content stats
-      const { base64 } = await provider.download(sessionId, creds);
+      // The background half downloads it; this page never sees a token.
+      const { base64 } = await API.downloadCloudFile(sessionId);
 
       // Decode the .authbook — it may be a JSON envelope or gzip'd JSON.
       // Try plain JSON first, then fall back to showing just the byte size.

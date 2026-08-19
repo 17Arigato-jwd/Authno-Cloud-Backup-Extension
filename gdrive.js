@@ -1,103 +1,41 @@
 /**
- * providers/gdrive.js — v2.0.0
+ * gdrive.js — the Google Drive provider — v2.0.0
  *
- * BREAKING CHANGE from v1.x:
- *   Replaced native GoogleSignIn Capacitor plugin with browser PKCE OAuth
- *   (same approach as DropboxProvider).
+ * Drive authorises differently from Dropbox, and the difference is the point
+ * of `auth.requestDriveToken` rather than `auth.oauth`:
  *
- *   Root cause of "Google sign-in was cancelled" (Images 2 + 3):
- *   ─────────────────────────────────────────────────────────────
- *   The previous implementation called:
- *     window.Capacitor.Plugins.GoogleSignIn.signIn({ clientId })
- *   The plugin parameter is `webClientId`, not `clientId`. Passing an
- *   unknown key caused the plugin to fall back to the `google-services.json`
- *   web_client entry — which was either missing or had a mismatched
- *   redirect_uri/SHA-1 fingerprint. Android's GoogleSignIn activity completed
- *   with RESULT_CANCELED instead of RESULT_OK, and the plugin threw
- *   "Google sign-in was cancelled".
+ * On Android, Play Services' Identity Authorization API derives the caller
+ * from the package name and signing certificate. No client id, no redirect
+ * URI, no browser, no client secret, and silent renewal once consented. There
+ * is nothing here that an OAuth round trip could carry.
  *
- *   Even with a correct webClientId, the native flow requires a server-side
- *   token exchange for Drive scopes — inappropriate for a mobile-only app
- *   with no backend. Using browser PKCE (RFC 7636) is the correct approach:
- *   it's publicly documented by Google for mobile/native apps, returns both
- *   access_token AND refresh_token directly, and needs no server endpoint.
+ * Off Android there is nothing to derive from, so the host falls back to a
+ * PKCE round trip and needs a Desktop OAuth client id. This extension does not
+ * carry one, so on desktop `connect()` fails with the host\'s own explanation
+ * of what to create. That is the honest state: Drive is Android-only in this
+ * build, and Dropbox and WebDAV are not.
  *
- *   Migration checklist:
- *   ─────────────────────────────────────────────────────────────
- *   1. In Google Cloud Console → OAuth 2.0 Clients:
- *      • Create or select the "Web application" client.
- *      • Under "Authorized redirect URIs" add:
- *          com.aurorastudios.authno://oauth2/gdrive
- *      • Copy the Web client ID into GDRIVE_WEB_CLIENT_ID below.
- *   2. In AndroidManifest.xml add an intent-filter for the gdrive path:
- *          <data android:scheme="com.aurorastudios.authno"
- *                android:host="oauth2"
- *                android:pathPrefix="/gdrive"/>
- *      (The existing dropbox filter already covers android:host="oauth2";
- *      just add the pathPrefix="/gdrive" variant alongside it.)
- *   3. Remove the @codetrix-studio/capacitor-google-auth plugin dependency
- *      — it is no longer used by this extension.
+ * What changed from v1 beyond the plumbing:
  *
- *   Token refresh:
- *   ─────────────────────────────────────────────────────────────
- *   Google refresh tokens for mobile PKCE flows do not expire as long as
- *   the app is used at least once every 6 months and the user hasn't revoked
- *   access.  connect() always passes prompt=consent to guarantee a fresh
- *   refresh_token on each explicit connect action.
+ *   - `window.Capacitor.Plugins.GoogleDrive` is gone. There are no globals in
+ *     a v2 frame; the host arrives as an argument.
+ *   - `disconnect()` no longer pretends to switch accounts. v1 called
+ *     `plugin.signOut()` and then `plugin.revoke()` in a try/catch with a
+ *     comment calling it essential — neither method exists in
+ *     GoogleDrivePlugin.java, so the catch swallowed a TypeError every time
+ *     and the next connect landed on the same account. It now calls
+ *     `authno.auth.signOut()`, which answers honestly, and the result decides
+ *     what the user is told.
  */
 
 import { BaseProvider } from './base.js';
+import { arrayBufferToBase64 } from './oauth.js';
 
-// ── Shared base64 helper (RC-5 FIX: large-file safe) ─────────────────────────
-function _arrayBufferToBase64(buf) {
-  const bytes  = new Uint8Array(buf);
-  let   binary = '';
-  const CHUNK  = 8192;
-  for (let i = 0; i < bytes.byteLength; i += CHUNK) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
-  }
-  return btoa(binary);
-}
-
-// ── Native Drive token helper ─────────────────────────────────────────────────
-//
-// Calls GoogleDrivePlugin.requestDriveToken() which uses the Google Identity
-// Authorization API (play-services-auth) to get an access token for drive.file.
-//
-// On first call: shows a native consent bottom-sheet (no browser, no custom scheme).
-// On subsequent calls: returns a fresh token silently if already authorized.
-// No refresh token or client secret needed — Identity.authorize() handles renewal.
-
-async function getNativeDriveToken() {
-  const plugin = window.Capacitor?.Plugins?.GoogleDrive;
-  if (!plugin?.requestDriveToken) {
-    throw new Error(
-      'GoogleDrive native plugin not available. ' +
-      'Make sure GoogleDrivePlugin is registered in MainActivity.java ' +
-      'and the app has been rebuilt.'
-    );
-  }
-  const result = await plugin.requestDriveToken();
-  if (!result?.accessToken) {
-    throw new Error('GoogleDrive plugin returned no access token');
-  }
-  return result.accessToken;
-}
-
-// Token validity window: refresh if less than 5 minutes remain.
-// Identity.authorize() is called each time the token nears expiry — it is
-// fast (no UI) for already-authorized users and only shows UI on first use
-// or if the user revokes access.
+// Token validity window: renew if less than five minutes remain. On Android
+// this is silent for an already-consented user, so it costs nothing to be
+// early and a request that fails on an expired token costs a retry.
 const TOKEN_REFRESH_MARGIN_MS = 5 * 60 * 1000;
 
-// ── GOOGLE DRIVE ──────────────────────────────────────────────────────────────
-
-// No client ID constant needed — the native GoogleDrivePlugin calls
-// Identity.getAuthorizationClient().authorize() which uses the app's own
-// Play Services identity, verified by the SHA-1 fingerprint and package name
-// already registered in Google Cloud Console under "Authno Android".
-// No redirect URI, no client secret, no browser tab.
-const GDRIVE_SCOPE       = 'https://www.googleapis.com/auth/drive.file'; // kept for reference
 const GDRIVE_FOLDER_NAME = 'AuthNo';
 
 export class GDriveProvider extends BaseProvider {
@@ -106,33 +44,36 @@ export class GDriveProvider extends BaseProvider {
   get icon() { return 'HardDrive'; }
 
   async connect(_config) {
-    // Uses native GoogleDrivePlugin (Identity Authorization API).
-    // No browser, no custom scheme, no client secret.
-    // Shows a native consent UI on first use; silent on subsequent calls.
-    const accessToken = await getNativeDriveToken();
+    const authno = this._authno;
+    // Native consent sheet on first use, silent afterwards. Off Android the
+    // host raises its own error naming the client id it would need.
+    const { accessToken } = await authno.auth.requestDriveToken();
+    if (!accessToken) throw new Error('Google returned no access token.');
     return { accessToken, expiresAt: Date.now() + 3600 * 1000 };
   }
 
   async disconnect(storage) {
-    // Sign out from the native GoogleDrive plugin so the next connect() call
-    // shows the account-picker UI instead of silently re-authorising the same
-    // account. This is essential for account switching.
-    try {
-      const plugin = window.Capacitor?.Plugins?.GoogleDrive;
-      if (plugin?.signOut)      await plugin.signOut();
-      else if (plugin?.revoke)  await plugin.revoke();  // older plugin API name
-    } catch (e) {
-      console.warn('[cloud-backup] gdrive signOut failed (non-fatal):', e.message);
-    }
+    const authno = this._authno;
+    // Clear our own credentials FIRST. If the native sign-out is unavailable —
+    // which it is, until GoogleDrivePlugin.java grows the method — the user
+    // must still end up disconnected rather than half-connected.
     await this.clearCreds(storage);
+
+    const out = await authno.auth.signOut();
+    // Reported, not swallowed. v1 swallowed exactly this and told the user the
+    // account had been switched when it had not.
+    return out?.ok
+      ? { signedOut: true }
+      : { signedOut: false, reason: out?.reason ?? 'unsupported' };
   }
 
   async _refreshIfNeeded(creds) {
-    // Token is still valid — reuse it.
     if (Date.now() < (creds.expiresAt ?? 0) - TOKEN_REFRESH_MARGIN_MS) return creds;
-    // Token is near expiry or missing — ask Identity API for a fresh one.
-    // For already-consented users this is instant (no UI shown).
-    const accessToken = await getNativeDriveToken();
+    if (!this._authno) throw new Error('Google Drive needs to be reconnected.');
+    // Silent for an already-consented user; a consent sheet only on first use
+    // or after the user revoked access in their Google account.
+    const { accessToken } = await this._authno.auth.requestDriveToken();
+    if (!accessToken) throw new Error('Google returned no access token.');
     return { ...creds, accessToken, expiresAt: Date.now() + 3600 * 1000 };
   }
 
@@ -338,7 +279,7 @@ export class GDriveProvider extends BaseProvider {
 
     const buf = await res.arrayBuffer();
     // RC-5 FIX: chunked conversion — safe for large .authbook files
-    const b64 = _arrayBufferToBase64(buf);
+    const b64 = arrayBufferToBase64(buf);
     return { base64: b64, modifiedAt: file.modifiedTime ?? new Date().toISOString() };
   }
 

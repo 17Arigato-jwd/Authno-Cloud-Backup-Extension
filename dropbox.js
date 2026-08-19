@@ -1,180 +1,29 @@
 /**
- * providers/dropbox.js — v1.5.0
+ * dropbox.js — the Dropbox provider — v2.0.0
  *
- * Changes from v1.4.0:
- *   - RC-4 FIX (cold-start): PKCE state ({ verifier, state, redirectUri,
- *     clientId, tokenUrl, extraTokenParams }) is persisted to
- *     sessionStorage.__pkce_pending BEFORE openBrowser() is called.
- *     If the app is killed and relaunched via the deep-link redirect,
- *     index.js activate() reads this state and re-dispatches the URL open
- *     event so the exchange can complete.  The handler clears the key on
- *     success OR on the 2-minute timeout so no stale state lingers.
+ * Renamed from dropbox_onedrive.js: OneDrive was removed in v1.3.0 and the
+ * filename outlived it by four releases.
  *
- *   - RC-6 FIX (duplicate listener): added `handled` boolean guard inside
- *     the __capacitor_app_url_open handler.  If two calls to pkceOAuthFlow
- *     somehow register two handlers (e.g. the user taps "Connect" twice),
- *     the first invocation to fire sets handled=true and removes itself;
- *     subsequent invocations from other handlers see handled=true and return
- *     immediately without double-resolving or leaking.
- *     Note: callers (Settings.js) should still disable the Connect button
- *     while a flow is in progress — defence-in-depth.
+ * What left this file for v2:
  *
- *   - RC-5 FIX (large-file base64): replaced
- *       btoa(String.fromCharCode(...new Uint8Array(buf)))
- *     with chunked _arrayBufferToBase64() helper.  The spread form passes
- *     every byte as a separate JS argument — V8 throws RangeError for
- *     buffers larger than ~50 MB.  The chunked form processes 8 192 bytes
- *     per iteration and never overflows the call stack.
+ *   - ~90 lines of hand-rolled PKCE, now `pkceOAuthFlow` in oauth.js, which is
+ *     four lines around one host call. See the note there — the cold-start
+ *     resume, the duplicate-listener guard and the redirect matching were all
+ *     this extension\'s problem in v1 and are the host\'s now.
+ *   - `window.CloudBackupAPI.openBrowser`. There are no globals inside a v2
+ *     frame; the host arrives as an argument.
  *
- * Changes from v1.3.0 → v1.4.0 (preserved):
- *   - DROPBOX_REDIRECT_URI: changed from 'com.aurorastudios.authno:/oauth2/dropbox'
- *     to 'com.aurorastudios.authno://oauth2/dropbox' (single colon-slash → double).
- *     android:host="oauth2" only matches URIs with an authority component (double-slash).
- *   - Added 2-minute OAUTH_TIMEOUT_MS so codePromise never hangs forever.
+ * What did not change: every `fetch` below. v2 enforces the network permission
+ * with the frame\'s Content-Security-Policy rather than with a bridge, so an
+ * ordinary fetch to a host named in the manifest simply works, and one to a
+ * host that is not named simply does not. api.dropboxapi.com and
+ * content.dropboxapi.com are both listed, because Dropbox splits metadata and
+ * content across two origins and missing the second would look like every
+ * upload failing while every listing succeeded.
  */
 
 import { BaseProvider } from './base.js';
-
-// ── Shared base64 helper ──────────────────────────────────────────────────────
-/**
- * RC-5 FIX: Memory-safe ArrayBuffer → base64 conversion.
- * Processes the buffer in 8 192-byte chunks to avoid exceeding the JS
- * engine's maximum argument count (typically 65 536 in V8).
- * btoa(String.fromCharCode(...new Uint8Array(buf))) crashes above ~50 MB.
- */
-function _arrayBufferToBase64(buf) {
-  const bytes  = new Uint8Array(buf);
-  let   binary = '';
-  const CHUNK  = 8192;
-  for (let i = 0; i < bytes.byteLength; i += CHUNK) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
-  }
-  return btoa(binary);
-}
-
-// ── PKCE utilities ────────────────────────────────────────────────────────────
-
-function randomBase64url(len) {
-  const arr = new Uint8Array(len);
-  crypto.getRandomValues(arr);
-  return btoa(String.fromCharCode(...arr)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
-}
-
-async function sha256Base64url(str) {
-  const enc  = new TextEncoder().encode(str);
-  const hash = await crypto.subtle.digest('SHA-256', enc);
-  return btoa(String.fromCharCode(...new Uint8Array(hash))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
-}
-
-const OAUTH_TIMEOUT_MS = 120_000; // 2 minutes
-
-/**
- * Generic PKCE OAuth 2.0 browser flow.
- *
- * Cold-start safety: persists { verifier, state, redirectUri, clientId,
- * tokenUrl, extraTokenParams } to sessionStorage.__pkce_pending before
- * opening the browser.  index.js activate() checks this key on startup and
- * re-dispatches __capacitor_app_url_open via Capacitor App.getLaunchUrl()
- * so the exchange completes even when the app was killed during the flow.
- *
- * Duplicate-listener safety: the `handled` flag ensures only one handler
- * instance processes the redirect — even if pkceOAuthFlow is called twice.
- */
-async function pkceOAuthFlow({ authUrl, tokenUrl, clientId, redirectUri, extraTokenParams = {} }) {
-  const verifier  = randomBase64url(64);
-  const challenge = await sha256Base64url(verifier);
-  const state     = randomBase64url(16);
-
-  const fullAuthUrl = authUrl + '&' + new URLSearchParams({
-    code_challenge:        challenge,
-    code_challenge_method: 'S256',
-    state,
-  });
-
-  const API = window.CloudBackupAPI;
-  if (!API?.openBrowser) throw new Error('CloudBackupAPI.openBrowser not available');
-
-  // ── RC-4 FIX: persist PKCE state for cold-start resume ───────────────────
-  sessionStorage.setItem('__pkce_pending', JSON.stringify({
-    verifier,
-    state,
-    redirectUri,
-    clientId,
-    tokenUrl,
-    extraTokenParams: JSON.stringify(extraTokenParams),
-  }));
-  // ──────────────────────────────────────────────────────────────────────────
-
-  let resolveCode, rejectCode;
-  const codePromise = new Promise((res, rej) => { resolveCode = res; rejectCode = rej; });
-
-  // ── RC-6 FIX: duplicate-listener guard ───────────────────────────────────
-  let handled = false;
-  // ──────────────────────────────────────────────────────────────────────────
-
-  const handler = (event) => {
-    // RC-6: if another handler already processed this event, bail out
-    if (handled) return;
-
-    const urlStr = event.detail?.url ?? '';
-    if (!urlStr.startsWith(redirectUri)) return;
-
-    // Mark handled BEFORE any async work so a second simultaneous call sees it
-    handled = true;
-    window.removeEventListener('__capacitor_app_url_open', handler);
-    API.closeBrowser().catch(() => {});
-
-    // RC-4: clear persisted PKCE state — exchange is in progress
-    sessionStorage.removeItem('__pkce_pending');
-
-    const url      = new URL(urlStr);
-    const code     = url.searchParams.get('code');
-    const gotState = url.searchParams.get('state');
-
-    if (gotState !== state) { rejectCode(new Error('State mismatch')); return; }
-    if (!code)              { rejectCode(new Error('No auth code'));    return; }
-    resolveCode(code);
-  };
-
-  window.addEventListener('__capacitor_app_url_open', handler);
-  await API.openBrowser(fullAuthUrl);
-
-  let code;
-  try {
-    const timeout = new Promise((_, rej) =>
-      setTimeout(() => rej(new Error('OAuth timed out — please try again')), OAUTH_TIMEOUT_MS)
-    );
-    code = await Promise.race([codePromise, timeout]);
-  } catch (err) {
-    window.removeEventListener('__capacitor_app_url_open', handler);
-    API.closeBrowser().catch(() => {});
-    // Clean up persisted state on timeout/error so a stale entry doesn't
-    // confuse the next cold-start resume attempt
-    sessionStorage.removeItem('__pkce_pending');
-    throw err;
-  }
-
-  const tokenRes = await fetch(tokenUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      client_id:     clientId,
-      redirect_uri:  redirectUri,
-      grant_type:    'authorization_code',
-      code,
-      code_verifier: verifier,
-      ...extraTokenParams,
-    }),
-  });
-
-  if (!tokenRes.ok) throw new Error(`Token exchange failed: ${tokenRes.status}`);
-  const tokens = await tokenRes.json();
-  return {
-    accessToken:  tokens.access_token,
-    refreshToken: tokens.refresh_token,
-    expiresAt:    Date.now() + (tokens.expires_in ?? 3600) * 1000,
-  };
-}
+import { pkceOAuthFlow, arrayBufferToBase64 } from './oauth.js';
 
 // ── DROPBOX ───────────────────────────────────────────────────────────────────
 
@@ -190,11 +39,14 @@ export class DropboxProvider extends BaseProvider {
   get icon() { return 'Box'; }
 
   async connect(_config) {
-    return pkceOAuthFlow({
+    return pkceOAuthFlow(this._authno, {
       authUrl: 'https://www.dropbox.com/oauth2/authorize?' + new URLSearchParams({
         client_id:         DROPBOX_CLIENT_ID,
         redirect_uri:      DROPBOX_REDIRECT_URI,
         response_type:     'code',
+        // Without this Dropbox issues a short-lived access token and no
+        // refresh token, and the extension silently stops backing up four
+        // hours after the user connects it.
         token_access_type: 'offline',
       }),
       tokenUrl:    'https://api.dropboxapi.com/oauth2/token',
@@ -423,7 +275,7 @@ export class DropboxProvider extends BaseProvider {
     const meta       = metaHeader ? JSON.parse(metaHeader) : {};
     const buf        = await res.arrayBuffer();
     // RC-5 FIX: chunked conversion — safe for large .authbook files
-    const b64        = _arrayBufferToBase64(buf);
+    const b64        = arrayBufferToBase64(buf);
     return { base64: b64, modifiedAt: meta.server_modified ?? new Date().toISOString() };
   }
 
