@@ -19,13 +19,14 @@
  *
  *   - `window.Capacitor.Plugins.GoogleDrive` is gone. There are no globals in
  *     a v2 frame; the host arrives as an argument.
- *   - `disconnect()` no longer pretends to switch accounts. v1 called
+ *   - `disconnect()` actually switches accounts now. v1 called
  *     `plugin.signOut()` and then `plugin.revoke()` in a try/catch with a
- *     comment calling it essential — neither method exists in
+ *     comment calling it essential — neither method existed in
  *     GoogleDrivePlugin.java, so the catch swallowed a TypeError every time
- *     and the next connect landed on the same account. It now calls
- *     `authno.auth.signOut()`, which answers honestly, and the result decides
- *     what the user is told.
+ *     and the next connect landed on the same account. It now hands its
+ *     access token to `authno.auth.signOut()`, which revokes it at Google's
+ *     endpoint: that drops the app's authorisation server-side, so the next
+ *     authorize() has nothing to reuse and asks again.
  */
 
 import { BaseProvider } from './base.js';
@@ -54,17 +55,25 @@ export class GDriveProvider extends BaseProvider {
 
   async disconnect(storage) {
     const authno = this._authno;
-    // Clear our own credentials FIRST. If the native sign-out is unavailable —
-    // which it is, until GoogleDrivePlugin.java grows the method — the user
-    // must still end up disconnected rather than half-connected.
+
+    // Read the token BEFORE clearing, because revoking it is what actually
+    // ends the grant. Without it Google keeps the authorisation, the next
+    // connect has something to reuse, and the account picker never appears —
+    // which is exactly the bug this used to have.
+    const held = await this.loadCreds(storage).catch(() => null);
+
+    // Clear our own credentials next. If the revoke fails the user must still
+    // end up disconnected rather than half-connected.
     await this.clearCreds(storage);
 
-    const out = await authno.auth.signOut();
+    const out = await authno.auth.signOut({ accessToken: held?.accessToken ?? null });
     // Reported, not swallowed. v1 swallowed exactly this and told the user the
     // account had been switched when it had not.
-    return out?.ok
-      ? { signedOut: true }
-      : { signedOut: false, reason: out?.reason ?? 'unsupported' };
+    // `ok` means the host reached the plugin; `revoked` means Google dropped
+    // the grant. Only the second one means the next connect will ask which
+    // account, so it is the one reported.
+    if (!out?.ok) return { signedOut: false, reason: out?.reason ?? 'unsupported' };
+    return { signedOut: true, revoked: !!out.revoked, reason: out.error ?? null };
   }
 
   async _refreshIfNeeded(creds) {
