@@ -1,26 +1,21 @@
 /**
- * queue.js — v1.3.0
+ * queue.js — the upload queue — v2.0.0
  *
- * Changes from v1.2.0:
- *   - process() now stamps lastUploadedAt on successful entries before removing
- *     them. Conflict detection in providers compares remoteTime > lastUploadedAt,
- *     so without this every upload after the first triggered a false conflict.
- *   - process() now removes permanently-failed entries (attempts >= MAX_TRIES)
- *     from the queue on each dirty save so they don't accumulate forever.
- *   - statusSummary() unchanged.
+ * This module never touched the host in v1 and does not now: it is given a
+ * `storage` and does arithmetic on a list. That is why it ports unchanged in
+ * substance, and it is worth saying out loud — the parts of an extension that
+ * do not reach for globals are the parts a platform change cannot break.
  *
- * Changes from v1.2.0 → v1.3.0:
- *   - process() now handles { skip: true } return from uploadFn.
- *     Previously, any non-ok, non-conflict result was treated as a thrown
- *     error, which incremented `attempts` and applied exponential backoff to
- *     EVERY entry in the queue — even sessions that just weren't available in
- *     that autosave cycle. With skip: true, those entries are left completely
- *     untouched so they remain at attempts=0 and are tried next cycle.
+ * The two behaviours worth keeping in mind when reading it:
  *
- *     Root cause: index.js returned { ok: false, error: '...' } for
- *     non-matching sessions, which fell to the catch block.
- *     Fix: index.js now returns { ok: false, skip: true }; process() continues
- *     without touching the entry.
+ *   - **`{ skip: true }` is not a failure.** A session that is not available
+ *     in this autosave cycle must be left at attempts=0. Returning
+ *     `{ ok: false, error }` for it — which is what v1 did before RC-3 — put
+ *     every unrelated entry in the queue into exponential backoff.
+ *
+ *   - **A conflict ends the entry.** attempts is set to MAX_TRIES so it stops
+ *     being retried, and the user is asked. Retrying a conflict just produces
+ *     the same conflict.
  */
 
 const QUEUE_KEY  = 'uploadQueue';
@@ -34,12 +29,14 @@ export class UploadQueue {
   }
 
   async _load() {
-    const raw = await this._storage.get(QUEUE_KEY);
-    return raw ? JSON.parse(raw) : [];
+    // getJSON rather than get + JSON.parse: the host's version returns the
+    // fallback for a corrupt value instead of undefined, so a damaged queue
+    // reads as an empty one rather than crashing every caller downstream.
+    return (await this._storage.getJSON(QUEUE_KEY, [])) ?? [];
   }
 
   async _save(queue) {
-    await this._storage.set(QUEUE_KEY, JSON.stringify(queue));
+    await this._storage.setJSON(QUEUE_KEY, queue);
   }
 
   async enqueue(session, providerKey) {

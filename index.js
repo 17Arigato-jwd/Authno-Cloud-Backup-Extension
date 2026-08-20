@@ -1,90 +1,76 @@
 /**
- * cloud-backup — index.js — v1.4.0
+ * cloud-backup — index.js — v2.0.0
  *
- * Changes from v1.3.0:
- *   - Removed OneDrive provider.
- *   - Fixed resolveConflict('use-cloud'): was a complete no-op — now downloads
- *     the cloud version and imports it via AuthNoExtensionAPI.
- *   - Fixed onConflict signature mismatch: sync.js called onConflict(oneObject)
- *     but handlers expected (entry, cloudModified) — cloudModified was always
- *     undefined in conflictContext, breaking ConflictResolution.js date display.
- *   - Fixed recordUpload: now called after each successful upload so the sync
- *     engine has an accurate lastUploadedAt baseline, preventing spurious
- *     re-downloads on the next poll.
- *   - Added to CloudBackupAPI: getSessions, importSession, exportSessionAs,
- *     syncNow — required by Settings.js, CloudFilePicker.js.
- *   - Extracted shared handleConflict / handleImport / getActiveCreds helpers
- *     to eliminate duplicated inline lambdas in pollNow calls.
+ * The port to extension API v2. What changed is not the sync logic — that is
+ * the same queue, the same poll, the same conflict rule — but everything
+ * around it, because v1 and v2 disagree about what an extension IS.
  *
- * Changes from v1.3.0 → v1.4.0:
- *   - RC-3 FIX: queue uploadFn now returns { skip: true } (not { ok: false,
- *     error: '...' }) for sessions that aren't this autosave's session, so
- *     queue.process() does not increment attempts on unrelated entries.
- *   - RC-4 FIX (cold-start): activate() now checks sessionStorage for a
- *     pending PKCE flow and — if one exists — retrieves the launch URL via
- *     Capacitor.Plugins.App.getLaunchUrl() and re-dispatches
- *     __capacitor_app_url_open so the pkceOAuthFlow handler can complete the
- *     exchange even when the app was cold-started by the redirect.
- *   - RC-7 FIX: resolveConflict('keep-local') now re-enqueues with { id,
- *     title, filePath } read from conflictContext storage, not just { id }.
- *   - Removed dead googleSignIn bridge — GDriveProvider.connect() now uses
- *     pkceOAuthFlow directly (same pattern as Dropbox).  Keeping the bridge
- *     would have left an unreachable code path that could confuse future
- *     callers.
+ * ── What went away ───────────────────────────────────────────────────────────
+ *
+ * `window.AuthNoExtensionAPI`, `window.CloudBackupAPI`, `window.Capacitor`,
+ * `sessionStorage`, and the `__capacitor_app_url_open` listener. Not renamed:
+ * gone. A v2 extension runs in a frame with an opaque origin and exactly one
+ * way out, so there is no `window` worth reading and no `parent` it can reach.
+ * The host arrives as the argument to `activate()`, and every method on it is
+ * a round trip the app can refuse.
+ *
+ * With them went the cold-start OAuth resume — thirty lines that existed
+ * because the OS can kill an app while its user is on a consent screen, and
+ * v1 owned the flow. The host owns it now, so there is nothing here to resume.
+ *
+ * ── What replaced the UI-page bridge ─────────────────────────────────────────
+ *
+ * v1 hung `window.CloudBackupAPI` on the page so Settings.js, CloudFilePicker
+ * and ConflictResolution could call into the running extension. In v2 each
+ * page is its own frame with its own opaque origin — there is no shared
+ * `window` to hang anything on, and that is the point rather than an oversight.
+ *
+ * The pages talk to this half through `storage`, which both halves can reach
+ * and neither can see the other's memory through. A page writes a request;
+ * this half reads it, does the work, and writes the answer back. Slower than a
+ * function call and unmistakably a boundary, which is the trade v2 is.
+ *
+ * ── What did NOT change ──────────────────────────────────────────────────────
+ *
+ * Every `fetch` in every provider. v2 enforces the network permission with the
+ * frame's Content-Security-Policy rather than a bridge, so a request to a host
+ * the manifest names simply works and one to a host it does not simply fails.
+ * There is no `network.fetch` to route through and no wrapper to forget.
  */
 
-import { UploadQueue }                         from './queue.js';
+import { UploadQueue } from './queue.js';
 import { startPolling, stopPolling, onProgress, recordUpload, pollNow } from './sync.js';
-import { GDriveProvider }                      from './gdrive.js';
-import { WebDAVProvider }                      from './webdav.js';
-import { DropboxProvider }                     from './dropbox_onedrive.js';
+import { GDriveProvider } from './gdrive.js';
+import { WebDAVProvider } from './webdav.js';
+import { DropboxProvider } from './dropbox.js';
 
-const PROVIDERS = {
-  gdrive:  new GDriveProvider(),
-  dropbox: new DropboxProvider(),
-  webdav:  new WebDAVProvider(),
-};
+/**
+ * How the settings pages ask this half to do something.
+ *
+ * A single storage key holding `{ id, name, args }`, and a second holding the
+ * answer. The id makes a reply match its request — without it a page that
+ * asked twice would read the first answer as the second's, which is how a
+ * "Sync now" tap ends up reporting the previous run's error.
+ */
+const REQUEST_KEY = '__request';
+const RESPONSE_KEY = '__response';
+const REQUEST_POLL_MS = 400;
 
-export function activate({ registerHook, storage, navigate, extension, openBrowser, closeBrowser }) {
+export function activate(authno) {
+  const { storage } = authno;
   const queue = new UploadQueue(storage);
 
-  // Feature E: wire progress events to storage so Settings.js can poll them
+  const PROVIDERS = {
+    gdrive: new GDriveProvider().bind(authno),
+    dropbox: new DropboxProvider().bind(authno),
+    webdav: new WebDAVProvider().bind(authno),
+  };
+
+  // Progress goes to storage so the settings page can read it. It is a
+  // one-way report, not a channel: the page never writes here.
   onProgress(async (event) => {
-    await storage.set('syncProgress', JSON.stringify(event));
+    try { await storage.setJSON('syncProgress', event); } catch { /* a report, not the work */ }
   });
-
-  // ── RC-4 FIX: Cold-start OAuth resume ──────────────────────────────────────
-  // If the app was killed while a PKCE flow was in progress, sessionStorage
-  // holds the pending state. The redirect URL is available via getLaunchUrl().
-  // Re-dispatch __capacitor_app_url_open so pkceOAuthFlow's handler can pick
-  // it up and complete the token exchange.
-  (async () => {
-    try {
-      const pending = sessionStorage.getItem('__pkce_pending');
-      if (!pending) return;
-
-      const appPlugin = window.Capacitor?.Plugins?.App;
-      if (!appPlugin) return;
-
-      const launchResult = await appPlugin.getLaunchUrl().catch(() => null);
-      const url = launchResult?.url;
-      if (!url) return;
-
-      // Only re-dispatch if the URL matches a known redirect prefix
-      const parsed = JSON.parse(pending);
-      if (!url.startsWith(parsed.redirectUri)) return;
-
-      // Give pkceOAuthFlow time to re-register its listener after module init
-      setTimeout(() => {
-        window.dispatchEvent(
-          new CustomEvent('__capacitor_app_url_open', { detail: { url } })
-        );
-      }, 100);
-    } catch (e) {
-      console.warn('[cloud-backup] cold-start OAuth resume failed:', e.message);
-    }
-  })();
-  // ──────────────────────────────────────────────────────────────────────────
 
   // ── Shared helpers ─────────────────────────────────────────────────────────
 
@@ -98,256 +84,336 @@ export function activate({ registerHook, storage, navigate, extension, openBrows
     return p ? p.refreshCreds(storage) : null;
   }
 
-  // Unified onConflict — called from both queue.process and sync polling.
-  // Signature: (entry: { sessionId, title, filePath? }, cloudModified: string)
+  /**
+   * Both copies changed. Record what is needed to resolve it and ask.
+   *
+   * `filePath` is persisted alongside because 'keep-local' re-enqueues from
+   * this record: without it every resolved conflict re-uploaded as "Untitled"
+   * with no path.
+   */
   async function handleConflict(entry, cloudModified) {
     const provider = await getActiveProvider();
-    await storage.set('conflictContext', JSON.stringify({
-      sessionId:    entry.sessionId,
-      title:        entry.title,
-      filePath:     entry.filePath ?? null,   // RC-7: persist for re-enqueue
+    await storage.setJSON('conflictContext', {
+      sessionId: entry.sessionId,
+      title: entry.title,
+      filePath: entry.filePath ?? null,
       cloudModified,
       providerName: provider?.name ?? 'Cloud',
-    }));
-    navigate(extension, 'conflict', null);
+    });
+    await authno.ui.navigate('conflict');
   }
 
-  // Unified onImport — called when a cloud download should be applied locally.
+  /**
+   * A book came down from the cloud; put it into the library.
+   *
+   * `library.create` rather than v1's `importSession`, and it needs
+   * `library:write`. The app decides whether that is a new book or an update
+   * to one it already has — this half only knows it holds bytes.
+   */
   async function handleImport(base64) {
-    const api = window.AuthNoExtensionAPI;
-    if (api?.importSession) await api.importSession(base64);
+    return authno.library.create({ data: base64 });
   }
+
+  /** A book, as bytes, ready to upload. Needs `library:export`. */
+  async function encodeBook(sessionId) {
+    const out = await authno.library.exportAs(sessionId, 'authbook');
+    // exportAs answers { filename, base64, mimeType } for the file formats and
+    // may answer bare base64 for authbook, depending on the app's exporter.
+    const base64 = typeof out === 'string' ? out : out?.base64;
+    if (!base64) throw new Error(`Could not read "${sessionId}" to back it up.`);
+    return base64;
+  }
+
+  const syncCtx = {
+    authno, storage, providers: PROVIDERS, getActiveCreds,
+    onImport: handleImport, onConflict: handleConflict,
+  };
 
   // ── Background sync polling ────────────────────────────────────────────────
 
-  startPolling(storage, PROVIDERS, getActiveCreds, handleImport, handleConflict);
+  startPolling(syncCtx);
 
-  // Reset permanently-failed entries on app start so they get one fresh attempt
-  queue.resetFailed().then(changed => {
-    if (changed) console.info('[cloud-backup] Retrying previously failed uploads on app start');
-  }).catch(e => console.error('[cloud-backup] resetFailed error:', e));
+  // Give permanently-failed entries one fresh attempt per app start, so a book
+  // that failed five times on a bad network is not stuck forever.
+  queue.resetFailed().catch((e) => console.error('[cloud-backup] resetFailed:', e.message));
 
-  // ── onSave(change) — mark session dirty ───────────────────────────────────
+  // ── onSave(change) — mark a book dirty ────────────────────────────────────
 
-  const unregChange = registerHook('onSave', async ({ session, trigger }) => {
+  const unregChange = authno.registerHook('onSave', async ({ session, trigger }) => {
     if (trigger !== 'change') return;
 
     const provider = await getActiveProvider();
     if (!provider) return;
+    if (!(await provider.refreshCreds(storage))) return;
 
-    const creds = await provider.refreshCreds(storage);
-    if (!creds) return;
-
-    // Feature C: per-book opt-out
-    const noBackup = await storage.get(`noBackup:${session.id}`);
-    if (noBackup === 'true') return;
+    if ((await storage.get(`noBackup:${session.id}`)) === 'true') return;
 
     await queue.enqueue(session, provider.id);
-    updateTileStatus(queue);
+    await updateTileStatus();
   });
 
-  // ── onSave(autosave) — process queue ──────────────────────────────────────
+  // ── onSave(autosave) — work the queue ─────────────────────────────────────
 
-  const unregAutosave = registerHook('onSave', async ({ session, trigger }) => {
+  const unregAutosave = authno.registerHook('onSave', async ({ session, trigger }) => {
     if (trigger !== 'autosave') return;
 
     const provider = await getActiveProvider();
     if (!provider) return;
 
-    // Refresh once before the full queue run; write back so token is persisted.
     const freshCreds = await provider.refreshCreds(storage);
     if (!freshCreds) return;
 
-    await queue.process(
-      async (entry) => {
-        // ── RC-3 FIX ────────────────────────────────────────────────────────
-        // Return { skip: true } instead of { ok: false, error: '...' }.
-        // queue.process() will leave this entry completely untouched — no
-        // attempt increment, no backoff — so it is retried next autosave cycle.
-        if (entry.sessionId !== session.id) {
-          return { ok: false, skip: true };
-        }
-        // ────────────────────────────────────────────────────────────────────
+    await queue.process(async (entry) => {
+      // Not this autosave's book. `skip` rather than an error, or every
+      // unrelated entry in the queue goes into exponential backoff for
+      // something that was never wrong with it.
+      if (entry.sessionId !== session.id) return { ok: false, skip: true };
 
-        const api = window.AuthNoExtensionAPI;
-        if (!api?.encodeSession) throw new Error('AuthNoExtensionAPI.encodeSession not available');
-        const base64 = await api.encodeSession(session);
+      const base64 = await encodeBook(entry.sessionId);
+      const result = await provider.upload(entry, freshCreds, base64);
+      if (result?.ok) await recordUpload(storage, entry.sessionId);
+      return result;
+    }, handleConflict);
 
-        console.log(`[cloud-backup] autosave upload: "${entry.title}" (${Math.round(base64.length * 0.75 / 1024)} KB)`);
-        const result = await provider.upload(entry, freshCreds, base64);
-
-        if (result?.ok) {
-          await recordUpload(storage, entry.sessionId);
-          console.log(`[cloud-backup] autosave upload OK: "${entry.title}"`);
-        }
-
-        return result;
-      },
-      handleConflict
-    );
-
-    updateTileStatus(queue);
-
-    // Immediate poll after uploads so bidirectional state is up to date
-    await pollNow(storage, PROVIDERS, getActiveCreds, handleImport, handleConflict).catch(() => {});
+    await updateTileStatus();
+    await pollNow(syncCtx).catch(() => {});
   });
 
-  // ── Helpers ────────────────────────────────────────────────────────────────
-
-  async function updateTileStatus(q) {
-    const status = await q.statusSummary();
-    await storage.set('tileStatus', status);
+  async function updateTileStatus() {
+    await storage.set('tileStatus', await queue.statusSummary());
   }
 
-  // ── Public surface for UI pages ───────────────────────────────────────────
+  // ── The operations the settings pages can ask for ─────────────────────────
 
-  window.CloudBackupAPI = {
-    // Browser bridge — extensions run as raw ES modules, can't bare-import Capacitor
-    openBrowser,
-    closeBrowser,
-
-    providers: PROVIDERS,
-    queue,
-    storage,
-    navigate,
-    extension,
-
-    // ── Host-app API bridges ──────────────────────────────────────────────
-    getSessions:     ()               => window.AuthNoExtensionAPI?.getSessions()            ?? [],
-    importSession:   (b64)            => window.AuthNoExtensionAPI?.importSession(b64),
-    exportSessionAs: (session, fmt)   => window.AuthNoExtensionAPI?.exportSessionAs(session, fmt),
-
-    // NOTE: googleSignIn bridge removed. GDriveProvider now uses pkceOAuthFlow
-    // (browser PKCE OAuth) the same way DropboxProvider does. The native
-    // GoogleSignIn Capacitor plugin is no longer called from this extension.
-
-    // ── Status & control ──────────────────────────────────────────────────
-
+  const OPERATIONS = {
     async getStatus() {
       return {
         activeProvider: await storage.get('activeProvider'),
-        tileStatus:     await storage.get('tileStatus') ?? 'synced',
-        queueEntries:   await queue.all(),
+        tileStatus: (await storage.get('tileStatus')) ?? 'synced',
+        queueEntries: await queue.all(),
       };
     },
 
-    async connectProvider(providerKey, config) {
+    async listBooks() {
+      return authno.library.list();
+    },
+
+    async connectProvider({ providerKey, config }) {
       const provider = PROVIDERS[providerKey];
       if (!provider) throw new Error(`Unknown provider: ${providerKey}`);
       const creds = await provider.connect(config);
       await provider.saveCreds(storage, creds);
       await storage.set('activeProvider', providerKey);
+      // WebDAV sets this when the origin was granted but the policy in THIS
+      // frame predates the grant. The app restarts the extension; the page
+      // needs to know that "connected" here means "connected in a moment".
+      return { pendingRestart: !!creds?._pendingRestart };
     },
 
     async disconnectProvider() {
       const provider = await getActiveProvider();
-      if (provider) await provider.disconnect(storage);
+      const result = provider ? await provider.disconnect(storage) : null;
       await storage.set('activeProvider', null);
       await queue.clear();
       await storage.set('tileStatus', 'synced');
+      return result ?? { signedOut: true };
     },
 
-    // Trigger an immediate sync — called by the "Sync now" button.
-    // Phase 1: queue every enabled book and upload them all to the cloud.
-    // Phase 2: poll the cloud for any changes made on other devices.
-    //
-    // getSessions() now returns full session objects (App.js was updated to
-    // pass the complete sessions array), so encodeSession() gets the chapters
-    // it needs to produce a real .authbook file.
+    /**
+     * Back everything up now, then check for anything newer in the cloud.
+     *
+     * Phase 1 uploads; phase 2 polls. In that order because a user who taps
+     * this has just written something and wants it safe — polling first would
+     * spend the network on checking before saving.
+     */
     async syncNow() {
       const provider = await getActiveProvider();
       if (provider) {
-        let freshCreds;
+        let freshCreds = null;
         try { freshCreds = await provider.refreshCreds(storage); } catch { freshCreds = null; }
 
         if (freshCreds) {
-          // Enqueue every session that hasn't been opted out
-          const sessions = await Promise.resolve(window.AuthNoExtensionAPI?.getSessions() ?? []);
-          for (const session of sessions) {
-            const noBackup = await storage.get(`noBackup:${session.id}`);
-            if (noBackup === 'true') continue;
-            await queue.enqueue(session, provider.id);
+          const books = await authno.library.list();
+          for (const book of books) {
+            if ((await storage.get(`noBackup:${book.id}`)) === 'true') continue;
+            await queue.enqueue(book, provider.id);
           }
-          updateTileStatus(queue);
+          await updateTileStatus();
 
-          // Process the whole queue (no session-ID filter — upload everything)
           await queue.process(async (entry) => {
-            const api = window.AuthNoExtensionAPI;
-            if (!api?.encodeSession) throw new Error('AuthNoExtensionAPI.encodeSession not available');
-            const allSessions = await Promise.resolve(api.getSessions() ?? []);
-            const full = allSessions.find(s => s.id === entry.sessionId);
-            if (!full) {
-              console.warn(`[cloud-backup] syncNow: session "${entry.sessionId}" not found in getSessions() — skipping`);
-              return { ok: false, skip: true };
-            }
-            console.log(`[cloud-backup] syncNow: encoding "${full.title ?? entry.sessionId}" (chapters: ${full.chapters?.length ?? 0})`);
-            const base64 = await api.encodeSession(full);
-            console.log(`[cloud-backup] syncNow: uploading "${full.title}" (${Math.round(base64.length * 0.75 / 1024)} KB)`);
+            const base64 = await encodeBook(entry.sessionId);
             const result = await provider.upload(entry, freshCreds, base64);
-            if (result?.ok) {
-              await recordUpload(storage, entry.sessionId);
-              console.log(`[cloud-backup] syncNow: upload OK — "${full.title}"`);
-            }
+            if (result?.ok) await recordUpload(storage, entry.sessionId);
             return result;
           }, handleConflict);
 
-          updateTileStatus(queue);
+          await updateTileStatus();
         }
       }
-      // Phase 2: download any cloud changes
-      await pollNow(storage, PROVIDERS, getActiveCreds, handleImport, handleConflict);
+      await pollNow(syncCtx);
+      return { ok: true };
     },
 
-    async resolveConflict(sessionId, resolution) {
+    async resolveConflict({ sessionId, resolution }) {
       const provider = await getActiveProvider();
-      if (!provider) throw new Error('No active provider');
+      if (!provider) throw new Error('Nothing is connected.');
 
       if (resolution === 'keep-local') {
-        // ── RC-7 FIX: re-enqueue with full session shape ─────────────────
-        // Read title and filePath from conflictContext (written by handleConflict).
-        // Previously: queue.enqueue({ id: sessionId }) — title always 'Untitled',
-        // filePath always null.
-        const raw = await storage.get('conflictContext').catch(() => null);
-        const ctx = raw ? JSON.parse(raw) : {};
+        const ctx = (await storage.getJSON('conflictContext', {})) ?? {};
         await queue.enqueue(
-          {
-            id:       sessionId,
-            title:    ctx.title    ?? 'Untitled',
-            filePath: ctx.filePath ?? null,
-          },
+          { id: sessionId, title: ctx.title ?? 'Untitled', filePath: ctx.filePath ?? null },
           provider.id,
         );
-        // ─────────────────────────────────────────────────────────────────
+        return { ok: true };
+      }
 
-      } else if (resolution === 'keep-local-no-upload') {
-        // User wants to keep their local version but NOT push it to cloud.
-        // Simply remove the conflicting entry from the queue so it's no
-        // longer stuck — the cloud version is left untouched.
+      if (resolution === 'keep-local-no-upload') {
+        // Keep this device's copy and leave the stored one alone. Dropping the
+        // entry is the whole action — the conflict was the queue being stuck.
         await queue.removeSession(sessionId);
+        return { ok: true };
+      }
 
-      } else if (resolution === 'use-cloud') {
-        // Download the cloud version and import it into the app
+      if (resolution === 'use-cloud') {
         const creds = await provider.refreshCreds(storage);
-        if (!creds) throw new Error('Not authenticated');
+        if (!creds) throw new Error('Nothing is connected.');
         const { base64 } = await provider.download(sessionId, creds);
         await handleImport(base64);
         await recordUpload(storage, sessionId);
+        return { ok: true };
       }
+
+      throw new Error(`Unknown resolution: ${resolution}`);
     },
 
-    // Feature C — per-book backup toggle
-    async isBookBackupDisabled(sessionId) {
+    async listCloudFiles() {
+      const provider = await getActiveProvider();
+      if (!provider) throw new Error('Nothing is connected.');
+      const creds = await provider.refreshCreds(storage);
+      if (!creds) throw new Error('Nothing is connected.');
+      return provider.listFiles(creds);
+    },
+
+    async restoreFromCloud({ sessionId }) {
+      const provider = await getActiveProvider();
+      if (!provider) throw new Error('Nothing is connected.');
+      const creds = await provider.refreshCreds(storage);
+      if (!creds) throw new Error('Nothing is connected.');
+      const { base64 } = await provider.download(sessionId, creds);
+      await handleImport(base64);
+      return { ok: true };
+    },
+
+    /**
+     * The bytes of one stored copy.
+     *
+     * Exists so a page never handles credentials. v1's pages read
+     * `creds:<provider>` straight out of storage, JSON.parsed it, and called
+     * `provider.download(id, creds)` themselves — so an access token lived in
+     * the settings frame, the conflict frame and the file picker as well as
+     * here. In v2 each of those is a separate frame with its own opaque
+     * origin, and the credentials stay in this one.
+     */
+    async downloadCloudFile({ sessionId }) {
+      const provider = await getActiveProvider();
+      if (!provider) throw new Error('Nothing is connected.');
+      const creds = await provider.refreshCreds(storage);
+      if (!creds) throw new Error('Nothing is connected.');
+      return provider.download(sessionId, creds);
+    },
+
+    /** Put one book in the cloud folder as a .txt/.html/.epub/.pdf file. */
+    async exportToCloud({ sessionId, format }) {
+      const provider = await getActiveProvider();
+      if (!provider) throw new Error('Nothing is connected.');
+      const creds = await provider.refreshCreds(storage);
+      if (!creds) throw new Error('Nothing is connected.');
+
+      const exported = await authno.library.exportAs(sessionId, format);
+      const base64 = typeof exported === 'string' ? exported : exported?.base64;
+      if (!base64) throw new Error('That book could not be turned into a file.');
+
+      const book = await authno.library.getAny(sessionId).catch(() => null);
+      const filename = exported?.filename
+        ?? `${(book?.title || 'book').replace(/[/\\:*?"<>|]/g, '')}.${format}`;
+
+      await provider.uploadRaw(filename, base64, creds);
+      return { filename, provider: provider.name };
+    },
+
+    async isBookBackupDisabled({ sessionId }) {
       return (await storage.get(`noBackup:${sessionId}`)) === 'true';
     },
-    async setBookBackupDisabled(sessionId, disabled) {
+
+    async setBookBackupDisabled({ sessionId, disabled }) {
       await storage.set(`noBackup:${sessionId}`, disabled ? 'true' : null);
+      return { ok: true };
     },
   };
 
-  return function deactivate() {
+  // ── Serving the settings pages ────────────────────────────────────────────
+  //
+  // Polling rather than an event, because there is no event to have: the two
+  // frames share storage and nothing else. 400ms is under the threshold where
+  // a button feels unresponsive and far above the rate at which a person taps.
+
+  let lastRequestId = null;
+  const requestTimer = setInterval(async () => {
+    let req;
+    try { req = await storage.getJSON(REQUEST_KEY, null); } catch { return; }
+    if (!req || req.id === lastRequestId) return;
+    lastRequestId = req.id;
+
+    const op = Object.prototype.hasOwnProperty.call(OPERATIONS, req.name)
+      ? OPERATIONS[req.name]
+      : null;
+
+    if (typeof op !== 'function') {
+      // hasOwnProperty, not `OPERATIONS[req.name]`: a page asking for
+      // "constructor" would otherwise get one from Object.prototype and have
+      // it called. The pages are ours, but the check costs one line.
+      await storage.setJSON(RESPONSE_KEY, { id: req.id, error: `Unknown operation: ${req.name}` });
+      return;
+    }
+
+    try {
+      const result = await op(req.args ?? {});
+      await storage.setJSON(RESPONSE_KEY, { id: req.id, result });
+    } catch (e) {
+      await storage.setJSON(RESPONSE_KEY, { id: req.id, error: String(e?.message ?? e) });
+    }
+  }, REQUEST_POLL_MS);
+
+  // ── The commands the manifest declares ────────────────────────────────────
+
+  // Each is named in the manifest's `commands` array; the host refuses any
+  // name that is not. So what the "Back up now" button can trigger is
+  // knowable by reading the manifest, before installing anything.
+  //
+  // `sync.status` is a readout — the settings page polls it — so it returns
+  // the status rather than acting on it.
+  const COMMANDS = {
+    'sync.now': () => OPERATIONS.syncNow(),
+    'auth.connect': () => authno.ui.navigate('settings'),
+    'auth.disconnect': () => OPERATIONS.disconnectProvider(),
+    'sync.status': () => OPERATIONS.getStatus(),
+  };
+
+  const commandOffs = [];
+  for (const [name, fn] of Object.entries(COMMANDS)) {
+    authno.commands.register(name, (args) => fn(args ?? {}))
+      .then((off) => commandOffs.push(off))
+      .catch((e) => console.error(`[cloud-backup] could not register ${name}:`, e.message));
+  }
+
+  return async function deactivate() {
+    // Order matters. Stop producing work first, then stop serving requests,
+    // then unhook — a hook that fires while the queue is mid-flush would
+    // enqueue into a queue nobody is going to process.
     stopPolling();
+    clearInterval(requestTimer);
     unregChange();
     unregAutosave();
-    delete window.CloudBackupAPI;
+    for (const off of commandOffs) { try { off(); } catch { /* going regardless */ } }
   };
 }

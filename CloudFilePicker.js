@@ -1,19 +1,26 @@
 /**
- * CloudFilePicker.js — Feature B: browse and import cloud files — v1.2.3
+ * CloudFilePicker.js — browse and restore stored copies — v2.0.0
  *
- * A full-screen file browser rendered inside the extension's iframe.
- * Accessible via: Settings.js → "Import from cloud" button.
+ * A full-screen file browser rendered inside the extension's own frame.
+ * Reached from Settings → "Import from cloud".
  *
  * Flow:
- *   1. Lists all .authbook files in the AuthNo folder on the active provider.
- *   2. User taps a file → confirmation sheet.
- *   3. On confirm: download → AuthNoExtensionAPI.importSession(base64) → success toast.
+ *   1. List the .authbook files in the AuthNo folder on the connected service.
+ *   2. Tap one → confirmation sheet.
+ *   3. Confirm → the background half downloads it and puts it in the library.
  *
- * Sessions already in the app are marked with a "✓ On device" badge.
- * The latest version from cloud is always offered for import (overwrite local).
+ * Books already on this device get a "✓ On device" badge; the stored copy is
+ * still offered, because "I have this one" and "mine is newer" are different
+ * questions and only the person can answer the second.
+ *
+ * What changed for v2: this page no longer touches credentials. It used to
+ * read `creds:<provider>` out of storage, JSON.parse it, and call
+ * `provider.download(id, creds)` itself — an access token sitting in the file
+ * picker. Downloading is now one named operation performed by the half that
+ * owns the token.
  */
 
-const API = window.CloudBackupAPI;
+import { API } from './pageApi.js';
 
 // ── Styles ───────────────────────────────────────────────────────────────────
 
@@ -98,18 +105,9 @@ const root = document.body;
     }
 
     localSessions = (await API.getSessions()) ?? [];
-
-    // Use refreshCreds so an expired token is silently refreshed and saved back
-    // before we hit listFiles. This is the root cause of "import doesn't work"
-    // when a session has been idle and the token has expired.
-    const provider = API.providers[activeProvider];
-    if (!provider?.listFiles) throw new Error('listFiles not supported by this provider');
-
-    // Load creds via refreshCreds (saves refreshed token back to storage)
-    const creds = await provider.refreshCreds(API.storage);
-    if (!creds) throw new Error('Not authenticated');
-
-    files = await provider.listFiles(creds);
+    // The background half refreshes the token before it lists, so an idle
+    // session no longer reports "import doesn't work".
+    files = await API.listCloudFiles();
     renderList();
   } catch (e) {
     root.innerHTML = `<div class="screen"><div class="err">${e.message}</div>
@@ -200,18 +198,11 @@ async function confirmImport() {
   if (btn) { btn.textContent = 'Downloading…'; btn.disabled = true; }
 
   try {
-    const { activeProvider } = await API.getStatus();
-    const provider = API.providers[activeProvider];
-
-    // Use refreshCreds so an expired token is refreshed and saved before download
-    const creds = await provider.refreshCreds(API.storage);
-    if (!creds) throw new Error('Not authenticated');
-
-    // Pass the actual cloud path when available (fixes Dropbox import path mismatch)
-    const f          = files.find(f => f.sessionId === selectedFile);
-    const downloadId = f?.dropboxPath ?? selectedFile;
-    const { base64 } = await provider.download(downloadId, creds);
-    await API.importSession(base64);
+    // The provider's own path when the listing gave one. Dropbox stores under
+    // `{Title}_{id}.authbook`, so an id reconstructed from the name misses any
+    // book whose title has changed since it was last uploaded.
+    const f = files.find((x) => x.sessionId === selectedFile);
+    await API.restoreFromCloud(f?.dropboxPath ?? selectedFile);
 
     dismissSheet();
     showToast('✓ Imported successfully');

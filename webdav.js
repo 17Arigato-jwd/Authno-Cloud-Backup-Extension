@@ -1,47 +1,48 @@
 /**
- * providers/webdav.js — v1.1.0
+ * webdav.js — any WebDAV server — v2.0.0
  *
- * Changes from v1.0.0:
- *   - RC-5 FIX: download() now uses _arrayBufferToBase64() (chunked, 8 192
- *     bytes per iteration) instead of
- *     btoa(String.fromCharCode(...new Uint8Array(buf))).
- *     The spread form passes every byte as a JS function argument; V8 throws
- *     RangeError: Maximum call stack size exceeded for buffers larger than
- *     ~50 MB. .authbook files for large password vaults can exceed this limit.
+ * This is the provider that v2\'s permission model could not express, and the
+ * one that shaped `network.requestHost`.
  *
- * Supports any WebDAV-compatible server: Nextcloud, ownCloud, Seafile,
- * and generic self-hosted servers via basic auth or bearer token.
+ * Google Drive and Dropbox live at origins this extension can name in its
+ * manifest, so the frame\'s Content-Security-Policy lists them and every fetch
+ * to them simply works. A WebDAV server is whichever one the person typed in.
+ * There is no host to declare, and the two ways out of that are both wrong:
+ * `connect-src *` for one provider gives every provider the internet, and
+ * refusing to support it removes the only option for someone who does not want
+ * their manuscripts on a company\'s servers.
  *
- * Config shape (stored via extension storage):
+ * So the extension asks at the moment the URL exists, the user answers, and
+ * the origin joins the policy. Two consequences to know:
+ *
+ *   1. **A grant does not reach a running frame.** A document cannot be
+ *      re-policied after it loads. `requestHost` resolves with
+ *      `needsRestart: true`, and the app restarts the extension so the grant
+ *      takes effect — but any fetch already in flight is still under the old
+ *      policy and will fail. `connect()` therefore asks BEFORE it probes.
+ *
+ *   2. **The limit is real.** The manifest allows two user hosts. An extension
+ *      that could accumulate origins would, and a policy naming forty of them
+ *      is a policy in name only.
+ *
+ * Config shape (this provider\'s credentials ARE its config):
  *   {
- *     baseUrl:    "https://cloud.example.com/remote.php/dav/files/user/AuthNo/",
- *     authType:   "basic" | "token",
- *     username:   "...",     // basic auth only
- *     password:   "...",     // basic auth only  — TODO: move to Android Keystore
- *     token:      "...",     // bearer token only — TODO: move to Android Keystore
+ *     baseUrl:  "https://cloud.example.com/remote.php/dav/files/user/AuthNo/",
+ *     authType: "basic" | "token",
+ *     username, password,   // basic
+ *     token,                // bearer
  *   }
  *
  * Remote path: <baseUrl><sessionId>.authbook
- *
  * WebDAV methods used: PUT, GET, HEAD, PROPFIND
  */
 
 import { BaseProvider } from './base.js';
+import { arrayBufferToBase64 } from './oauth.js';
 
-// ── Shared base64 helper (RC-5 FIX: large-file safe) ─────────────────────────
-/**
- * Converts an ArrayBuffer to a base64 string in 8 192-byte chunks.
- * The naive spread form — btoa(String.fromCharCode(...new Uint8Array(buf))) —
- * overflows the call stack for buffers larger than ~50 MB.
- */
-function _arrayBufferToBase64(buf) {
-  const bytes  = new Uint8Array(buf);
-  let   binary = '';
-  const CHUNK  = 8192;
-  for (let i = 0; i < bytes.byteLength; i += CHUNK) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
-  }
-  return btoa(binary);
+/** The origin of a URL, which is the unit a CSP grant is made in. */
+function originOf(url) {
+  try { return new URL(url).origin; } catch { return null; }
 }
 
 export class WebDAVProvider extends BaseProvider {
@@ -50,17 +51,52 @@ export class WebDAVProvider extends BaseProvider {
   get icon() { return 'Server'; }
 
   async connect(config) {
-    // Validate config by doing a PROPFIND on the base URL
-    const headers = this._authHeaders(config);
+    const origin = originOf(config?.baseUrl);
+    if (!origin) throw new Error('That does not look like a web address.');
+    if (!origin.startsWith('https://')) {
+      // Refused here rather than by the policy, so the reason is a sentence
+      // rather than a failed request. Credentials go in the first header of
+      // the first call; over http they go in clear text.
+      throw new Error('A WebDAV address has to start with https:// — your username and password travel with every request.');
+    }
+
+    // Ask BEFORE probing. The probe below is a fetch, and a fetch to an origin
+    // that is not yet in this frame's policy is refused by the browser — so
+    // probing first would fail every time and report it as a bad server.
+    const grant = await this._authno.network.requestHost(origin);
+    if (!grant?.ok) throw new Error(this._grantRefusal(grant));
+
+    if (grant.needsRestart) {
+      // The policy in this document cannot change; the app restarts the
+      // extension so the next one has the origin. Saying so is the whole
+      // point — a silent failure here looks like a server that is down.
+      return { ...config, _pendingRestart: true };
+    }
+
     const res = await fetch(config.baseUrl, {
       method: 'PROPFIND',
-      headers: { ...headers, Depth: '0' },
+      headers: { ...this._authHeaders(config), Depth: '0' },
     });
     if (!res.ok && res.status !== 207) {
-      throw new Error(`WebDAV connection failed (${res.status}). Check your URL and credentials.`);
+      throw new Error(`Your server answered ${res.status}. Check the address and your sign-in details.`);
     }
-    // Config IS the credentials for WebDAV
-    return config;
+    return config;   // for WebDAV the config IS the credentials
+  }
+
+  /** Why a host grant did not happen, in words a person can act on. */
+  _grantRefusal(grant) {
+    switch (grant?.reason) {
+      case 'declined':
+        return 'You did not allow a connection to that server.';
+      case 'too-many-hosts':
+        return 'This extension is already allowed as many servers as it can have. Disconnect one first.';
+      case 'no-network-permission':
+        return 'This extension has not been allowed to connect to the internet.';
+      case 'bad-host':
+        return `That address cannot be used: ${grant.detail ?? 'it is not a plain https origin'}.`;
+      default:
+        return 'That server could not be allowed.';
+    }
   }
 
   async disconnect(storage) {
@@ -161,7 +197,7 @@ export class WebDAVProvider extends BaseProvider {
     const buf = await res.arrayBuffer();
     // RC-5 FIX: chunked conversion — safe for large .authbook files.
     // Old code: btoa(String.fromCharCode(...new Uint8Array(buf))) → stack overflow above ~50 MB
-    const base64 = _arrayBufferToBase64(buf);
+    const base64 = arrayBufferToBase64(buf);
     return { base64, modifiedAt: res.headers.get('Last-Modified') ?? new Date().toISOString() };
   }
 

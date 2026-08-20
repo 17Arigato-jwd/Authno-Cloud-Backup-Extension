@@ -1,7 +1,30 @@
+import { API } from './pageApi.js';
+
 /**
- * Settings.js — cloud-backup extension UI — v1.4.0
+ * Settings.js — cloud-backup extension UI — v2.0.0
  *
- * Changes from v1.3.2:
+ * The v2 port of this file is almost entirely at the top: `API` is imported
+ * from pageApi.js rather than read off `window.CloudBackupAPI`, and the four
+ * places that handled credentials now name an operation instead. The rendering
+ * below is unchanged, which is the point — a page that only asks for things
+ * did not have to be rewritten to ask a different way.
+ *
+ * Two behaviours changed on purpose:
+ *
+ *   - **The .extbk import corner button is gone.** It listed .extbk files,
+ *     downloaded the one you tapped, called `API.importExtension?.(base64)` —
+ *     a method that has never existed on any version of this API — and then
+ *     showed "✓ Done". So it downloaded a file, discarded it, and reported
+ *     success. There is no v2 capability for an extension to install another
+ *     extension, and there should not be: that is the one grant from which
+ *     every other grant follows.
+ *
+ *   - **Connecting to WebDAV can now report "in a moment".** Granting a new
+ *     origin cannot re-policy a document that has already loaded, so the app
+ *     restarts the extension and the page says so rather than showing an
+ *     error for a connection that is about to work.
+ *
+ * Changes from v1.3.2 (kept for the history):
  *   - Google Drive connected view replaced with a bespoke layout:
  *       • Frosted-glass header with gradient status circle (dark→light green)
  *       • Semi-transparent frosted-glass book-list with green iOS-style toggles
@@ -365,21 +388,11 @@ document.head.insertAdjacentHTML('beforeend', `<style>
     letter-spacing: .04em; pointer-events: none;
   }
 
-  /* ── .extbk import corner button (shared by GDrive + generic views) ─────── */
-  .extbk-btn {
-    position: absolute; top: 10px; right: 10px;
-    display: flex; align-items: center; gap: 4px;
-    background: rgba(30,30,44,0.85); border: 1px solid rgba(255,255,255,0.10);
-    color: #9090b8; border-radius: 20px; padding: 4px 10px 4px 7px;
-    font-size: 10px; font-weight: 600; letter-spacing: .03em;
-    cursor: pointer; transition: color .15s, border-color .15s;
-    -webkit-tap-highlight-color: transparent; z-index: 5;
-  }
-  .extbk-btn:hover { color: #c0c0f0; border-color: rgba(255,255,255,0.22); }
-  .extbk-btn svg  { flex-shrink: 0; }
 `);
 
-function getAPI() { return window.CloudBackupAPI; }
+// One import replaces the global. See pageApi.js for which calls go straight
+// to the host and which go through the background half, and why.
+function getAPI() { return API; }
 
 // ── HTML escape utility ───────────────────────────────────────────────────────
 function esc(s) {
@@ -407,9 +420,8 @@ function startProgressPoll() {
   if (_progressPoll) return;
   _progressPoll = setInterval(async () => {
     try {
-      const raw = await getAPI().storage.get('syncProgress');
-      if (!raw) return;
-      updateProgressBar(JSON.parse(raw));
+      const event = await API.storage.getJSON('syncProgress', null);
+      if (event) updateProgressBar(event);
     } catch {}
   }, 1500);
 }
@@ -584,15 +596,6 @@ async function renderConnectedView() {
 
   root.innerHTML = `<div class="page" style="position:relative">
 
-    <!-- .extbk import corner button -->
-    <button class="extbk-btn" id="btn-extbk" title="Import extension backup (.extbk)">
-      <svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24"
-        fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-        <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
-      </svg>
-      .extbk
-    </button>
 
     <div class="card">
       <div style="display:flex;align-items:center;justify-content:space-between">
@@ -658,9 +661,6 @@ async function renderConnectedView() {
 
   startProgressPoll();
 
-  document.getElementById('btn-extbk')?.addEventListener('click', () => {
-    _promptExtbkImport(activeProvider);
-  });
 
   document.getElementById('btn-disconnect')?.addEventListener('click', async () => {
     stopProgressPoll();
@@ -676,7 +676,10 @@ async function renderConnectedView() {
   });
 
   document.getElementById('btn-import')?.addEventListener('click', () => {
-    API.navigate(API.extension, 'cloud-files', null);
+    // (pageId, session) — v1's navigate took the extension object first,
+    // because the host had to be told which extension was asking. In v2 the
+    // frame IS the extension, so the host already knows.
+    API.navigate('cloud-files', null);
   });
 
   document.getElementById('btn-export')?.addEventListener('click', async () => {
@@ -686,15 +689,10 @@ async function renderConnectedView() {
     const btn       = document.getElementById('btn-export');
     btn.textContent = 'Exporting…'; btn.disabled = true; msg.textContent = '';
     try {
-      const session = sessions.find(s => s.id === sessionId);
-      if (!session) throw new Error('Session not found');
-      const exported = await API.exportSessionAs(session, format);
-      if (!exported?.base64) throw new Error('Export returned no data');
-      const credsRaw = await API.storage.get(`creds:${activeProvider}`);
-      const creds = JSON.parse(credsRaw);
-      const provider = API.providers[activeProvider];
-      const fname = exported.filename ?? `${session.title || 'book'}.${format}`;
-      await provider.uploadRaw(fname, exported.base64, creds);
+      // One operation. v1 read the credentials into this page, exported the
+      // book here, and uploaded from here — three steps, and an access token
+      // in the settings frame for something the background half does whole.
+      const { filename: fname } = await API.exportToCloud(sessionId, format);
       msg.style.color = '#22c55e'; msg.textContent = `✓ Exported ${fname} to ${p.label}`;
     } catch (e) {
       msg.style.color = '#ef4444'; msg.textContent = e.message;
@@ -792,15 +790,6 @@ async function renderGDriveView() {
 
   root.innerHTML = `<div class="gd-screen">
 
-    <!-- .extbk import corner button -->
-    <button class="extbk-btn" id="gd-btn-extbk" title="Import extension backup (.extbk)">
-      <svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24"
-        fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-        <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
-      </svg>
-      .extbk
-    </button>
 
     <!-- ① Header -->
     <div class="gd-tile gd-header">
@@ -872,10 +861,6 @@ async function renderGDriveView() {
 
   startProgressPoll();
 
-  // ── .extbk import ────────────────────────────────────────────────────────
-  document.getElementById('gd-btn-extbk')?.addEventListener('click', () => {
-    _promptExtbkImport(activeProvider);
-  });
 
   // ── Disconnect ────────────────────────────────────────────────────────────
   document.getElementById('gd-btn-disconnect')?.addEventListener('click', async () => {
@@ -945,15 +930,10 @@ async function renderGDriveView() {
     if (msg) msg.textContent = '';
 
     try {
-      const session = sessions.find(s => s.id === sessionId);
-      if (!session) throw new Error('Session not found');
-      const exported = await API.exportSessionAs(session, format);
-      if (!exported?.base64) throw new Error('Export returned no data');
-      const credsRaw = await API.storage.get(`creds:${activeProvider}`);
-      const creds = JSON.parse(credsRaw);
-      const provider = API.providers[activeProvider];
-      const fname = exported.filename ?? `${session.title || 'book'}.${format}`;
-      await provider.uploadRaw(fname, exported.base64, creds);
+      // One operation. v1 read the credentials into this page, exported the
+      // book here, and uploaded from here — three steps, and an access token
+      // in the settings frame for something the background half does whole.
+      const { filename: fname } = await API.exportToCloud(sessionId, format);
       if (msg) { msg.style.color = '#4ade80'; msg.textContent = `✓ Exported ${fname}`; }
     } catch (e) {
       if (msg) { msg.style.color = '#f87171'; msg.textContent = e.message; }
@@ -974,16 +954,10 @@ async function renderGDriveView() {
 async function _gdLoadImportPanel(panel) {
   panel.innerHTML = `<div class="gd-import-state">Loading…</div>`;
   try {
-    const API = getAPI();
-    const { activeProvider } = await API.getStatus();
-    const provider = API.providers[activeProvider];
-    if (!provider?.listFiles) throw new Error('listFiles not supported');
+    // The background half refreshes the token before it lists, so a page left
+    // open for a while does not fail with "not authenticated".
 
-    // Refresh + persist token before hitting the API
-    const creds = await provider.refreshCreds(API.storage);
-    if (!creds) throw new Error('Not authenticated');
-
-    const files         = await provider.listFiles(creds);
+    const files         = await API.listCloudFiles();
     const localSessions = (await API.getSessions()) ?? [];
 
     if (!files.length) {
@@ -1032,127 +1006,17 @@ window.gdImportFile = async (sessionId, displayName) => {
   if (badge) badge.textContent = '…';
 
   try {
-    const { activeProvider } = await API.getStatus();
-    const provider           = API.providers[activeProvider];
-
-    // Use refreshCreds so expired tokens are silently renewed and saved back
-    const creds = await provider.refreshCreds(API.storage);
-    if (!creds) throw new Error('Not authenticated');
-
-    // Prefer the actual cloud path stored on the file entry (fixes Dropbox path mismatch)
-    const fileEntry  = (panel._files ?? []).find(f => f.sessionId === sessionId);
-    const downloadId = fileEntry?.dropboxPath ?? sessionId;
-
-    const { base64 } = await provider.download(downloadId, creds);
-    await API.importSession(base64);
+    // The provider's own path when the listing gave one. Dropbox stores under
+    // `{Title}_{id}.authbook`, so an id rebuilt from the name misses any book
+    // whose title changed since it was last uploaded.
+    const fileEntry = (panel._files ?? []).find(f => f.sessionId === sessionId);
+    await API.restoreFromCloud(fileEntry?.dropboxPath ?? sessionId);
     if (badge) { badge.className = 'gd-badge-on-device'; badge.textContent = '✓ On device'; }
   } catch (e) {
     console.error('[cloud-backup] gdImportFile failed:', e);
     if (badge) { badge.style.color = '#f87171'; badge.textContent = 'Failed'; }
   }
 };
-
-// ═════════════════════════════════════════════════════════════════════════════
-//  SHARED .extbk IMPORT HELPER
-// ═════════════════════════════════════════════════════════════════════════════
-
-/**
- * Lists .extbk files in the cloud, shows a bottom-sheet picker, downloads
- * the selected file, and calls API.importExtension(base64).
- * Works for any connected provider that has listFiles().
- */
-async function _promptExtbkImport(providerKey) {
-  const API    = getAPI();
-  const extbkSheetId = 'extbk-sheet';
-
-  // Remove any existing sheet
-  document.getElementById(extbkSheetId)?.remove();
-
-  // Build and attach the sheet skeleton immediately (shows loading state)
-  const overlay = document.createElement('div');
-  overlay.id = extbkSheetId;
-  overlay.style.cssText = `
-    position:fixed;inset:0;background:rgba(0,0,0,.6);
-    display:flex;align-items:flex-end;z-index:200;
-  `;
-  overlay.innerHTML = `
-    <div style="background:#1a1a24;border-radius:16px 16px 0 0;padding:20px 20px 36px;
-                width:100%;border-top:1px solid #2e2e3a;max-height:70vh;overflow-y:auto">
-      <div style="font-size:15px;font-weight:700;margin-bottom:4px">Import .extbk</div>
-      <div style="font-size:12px;color:#6b6b80;margin-bottom:16px">
-        Extension backup files from your AuthNo cloud folder
-      </div>
-      <div id="extbk-list" style="font-size:13px;color:#6b6b80">Loading…</div>
-      <button onclick="document.getElementById('${extbkSheetId}')?.remove()"
-        style="margin-top:14px;width:100%;padding:11px;background:#1f1f2a;
-               border:1px solid #2e2e3a;color:#e4e4f0;border-radius:10px;
-               font-size:14px;font-weight:600;cursor:pointer">
-        Cancel
-      </button>
-    </div>`;
-  document.body.appendChild(overlay);
-  // Dismiss on backdrop tap
-  overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
-
-  const listEl = document.getElementById('extbk-list');
-
-  try {
-    const credsRaw = await API.storage.get(`creds:${providerKey}`);
-    if (!credsRaw) throw new Error('Not authenticated');
-    const creds    = JSON.parse(credsRaw);
-    const provider = API.providers[providerKey];
-    if (!provider?.listFiles) throw new Error('Provider does not support file listing');
-
-    const allFiles   = await provider.listFiles(creds);
-    const extbkFiles = allFiles.filter(f => f.name.endsWith('.extbk'));
-
-    if (!extbkFiles.length) {
-      listEl.textContent = 'No .extbk files found in your AuthNo folder.';
-      return;
-    }
-
-    listEl.innerHTML = extbkFiles.map((f, i) => `
-      <div style="display:flex;align-items:center;gap:10px;padding:10px 4px;
-                  border-bottom:1px solid rgba(255,255,255,0.05);cursor:pointer"
-           id="extbk-row-${i}">
-        <span>🧩</span>
-        <span style="flex:1;font-size:13px;color:#ddddf0;
-                     overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
-          ${esc(f.name)}
-        </span>
-        <span id="extbk-badge-${i}"
-          style="font-size:10px;font-weight:700;padding:2px 7px;border-radius:5px;
-                 background:rgba(99,102,241,0.14);color:#818cf8;white-space:nowrap">
-          Import
-        </span>
-      </div>`).join('');
-
-    extbkFiles.forEach((f, i) => {
-      document.getElementById(`extbk-row-${i}`)?.addEventListener('click', async () => {
-        const badge = document.getElementById(`extbk-badge-${i}`);
-        if (badge) badge.textContent = '…';
-        try {
-          const freshCredsRaw = await API.storage.get(`creds:${providerKey}`);
-          const freshCreds    = JSON.parse(freshCredsRaw);
-          // download() accepts a path or sessionId; pass the raw name for extbk files
-          const { base64 } = await provider.download(f.sessionId ?? f.name, freshCreds);
-          await API.importExtension?.(base64);
-          if (badge) {
-            badge.textContent = '✓ Done';
-            badge.style.background = 'rgba(34,197,94,0.14)';
-            badge.style.color = '#4ade80';
-          }
-        } catch (e) {
-          if (badge) { badge.textContent = 'Failed'; badge.style.color = '#f87171'; }
-          console.error('[cloud-backup] extbk import failed:', e);
-        }
-      });
-    });
-
-  } catch (e) {
-    if (listEl) { listEl.style.color = '#f87171'; listEl.textContent = e.message; }
-  }
-}
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  INIT

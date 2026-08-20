@@ -1,17 +1,35 @@
 /**
- * providers/base.js — v1.2.0
+ * base.js — what every provider has in common — v2.0.0
  *
- * Changes from v1.1.0:
- *   - Added _refreshIfNeeded(creds) base implementation (returns creds unchanged)
- *     so subclasses that don't override it still work in refreshCreds().
- *   - Added refreshCreds(storage): loads creds, refreshes if expired, saves back.
- *     Call this instead of loadCreds() before any upload or download so tokens
- *     are always persisted after a refresh. Fixes the silent token-discard bug
- *     where _refreshIfNeeded() returned a new token that was never saved.
+ * Unchanged from v1 apart from using the host's JSON storage helpers, because
+ * nothing in here ever touched the host directly.
+ *
+ * `refreshCreds` is the method to call before any request. `loadCreds` alone
+ * loses a refreshed token: `_refreshIfNeeded` returns a new object and only
+ * `refreshCreds` writes it back, so a caller that skips it re-refreshes on
+ * every single request and — with providers that rotate refresh tokens —
+ * eventually presents one the provider has already retired.
  */
 
 export class BaseProvider {
-  constructor(id) { this.id = id; }
+  constructor(id) { this.id = id; this._authno = null; }
+
+  /**
+   * Hand this provider the host API, once, at activate().
+   *
+   * Instance state rather than a module-level variable, and that distinction
+   * is the whole v2 story in miniature: v1 reached for
+   * `window.CloudBackupAPI` from wherever it happened to need it, so any code
+   * in the frame could use any capability and nothing recorded who asked. A
+   * provider that is *given* the host can only use what it was given, and the
+   * giving happens in one line in index.js that is easy to read.
+   *
+   * It is on the instance rather than threaded through every method because
+   * `_refreshIfNeeded` is called from five places inside each provider, and a
+   * token that expires halfway through a sixty-book poll has to renew without
+   * every call site having remembered to pass a context down.
+   */
+  bind(authno) { this._authno = authno; return this; }
 
   get name() { throw new Error('not implemented'); }
   get icon() { return 'Cloud'; }
@@ -34,16 +52,15 @@ export class BaseProvider {
   credsKey() { return `creds:${this.id}`; }
 
   async loadCreds(storage) {
-    const raw = await storage.get(this.credsKey());
-    return raw ? JSON.parse(raw) : null;
+    return (await storage.getJSON(this.credsKey(), null)) ?? null;
   }
 
   async saveCreds(storage, creds) {
-    await storage.set(this.credsKey(), JSON.stringify(creds));
+    await storage.setJSON(this.credsKey(), creds);
   }
 
   async clearCreds(storage) {
-    await storage.set(this.credsKey(), null);
+    await storage.remove(this.credsKey());
   }
 
   async refreshCreds(storage) {
