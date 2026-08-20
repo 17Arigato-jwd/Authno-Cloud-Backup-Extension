@@ -1,0 +1,114 @@
+name: Release
+
+# Cloud Backup had no CI at all, which is why 2.0.0 sat merged and unreleased:
+# nothing existed to build the package or publish it, and doing it by hand
+# leaves no record of which bytes came from which commit.
+#
+# The package is built by the extbk CLI, which lives in the app repo — one
+# builder for one format, rather than a second copy here that can drift from
+# the reader the app actually uses.
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_ref:
+        description: "Ref of Authno-Android to take the extbk CLI from"
+        default: "main"
+      prerelease:
+        description: "Mark the release as a pre-release"
+        type: boolean
+        default: false
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the extension
+        uses: actions/checkout@v4
+        with:
+          path: extension
+
+      # The CLI is not on npm. Taking it from the app repo at a named ref means
+      # the package is built by the same code that ships in the app, and the
+      # ref is recorded in the run.
+      - name: Check out the extbk CLI
+        uses: actions/checkout@v4
+        with:
+          repository: 17Arigato-jwd/Authno-Android
+          ref: ${{ inputs.app_ref || 'main' }}
+          path: app
+          sparse-checkout: extensions/extbk-cli
+
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+
+      - name: Install CLI dependencies
+        working-directory: app/extensions/extbk-cli
+        run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+
+      - name: Read the version from the manifest
+        id: v
+        run: |
+          VER=$(node -p "require('./extension/manifest.json').version")
+          ID=$(node -p "require('./extension/manifest.json').id")
+          echo "version=$VER" >> $GITHUB_OUTPUT
+          echo "id=$ID"       >> $GITHUB_OUTPUT
+          echo "Building $ID v$VER"
+
+          # A tag push has to agree with the manifest, or the release is named
+          # one thing and contains another.
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME#v}"
+            if [ "$TAG" != "$VER" ]; then
+              echo "::error title=Version mismatch::tag v$TAG does not match manifest $VER"
+              exit 1
+            fi
+          fi
+
+      - name: Build the package
+        run: |
+          mkdir -p dist
+          node app/extensions/extbk-cli/src/cli.js build extension --out-dir dist --overwrite
+
+      # The CLI validates its own output — which it could not do until the
+      # check command learned to read VCHS-EPK. Building a package nobody has
+      # opened is how a broken one ships.
+      - name: Check the package
+        run: |
+          node app/extensions/extbk-cli/src/cli.js check dist/*.extbk
+          node app/extensions/extbk-cli/src/cli.js info  dist/*.extbk
+
+      - name: Checksum
+        run: |
+          cd dist
+          sha256sum *.extbk | tee SHA256SUMS.txt
+
+      - name: Release notes
+        run: |
+          if [ -f extension/CHANGELOG.md ]; then
+            awk -v ver="## ${{ steps.v.outputs.version }}" '
+              $0 == ver { grab = 1; next }
+              grab && /^## / { exit }
+              grab { print }
+            ' extension/CHANGELOG.md > notes.md
+          fi
+          if [ ! -s notes.md ]; then
+            echo "Cloud Backup ${{ steps.v.outputs.version }}." > notes.md
+          fi
+          cat notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.v.outputs.version }}
+          name: Cloud Backup ${{ steps.v.outputs.version }}
+          body_path: notes.md
+          prerelease: ${{ inputs.prerelease || false }}
+          files: |
+            dist/*.extbk
+            dist/SHA256SUMS.txt
