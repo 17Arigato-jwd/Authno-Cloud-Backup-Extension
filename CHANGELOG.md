@@ -2,6 +2,16 @@
 
 All notable, user-facing changes.
 
+## 2.1.0
+
+_The pages follow your theme._
+
+- **Every page is readable on a light theme.** On Sepia and Paper the headings
+  were dark grey on cream and effectively invisible, and the panels below them
+  were dark rectangles on a pale page. Sign-in, Cloud Files and Resolve Conflict
+  all now take their colours from whichever theme you are using, including your
+  accent colour.
+
 ## 2.0.1
 
 _Four things that made a copy less reliable than it looked._
