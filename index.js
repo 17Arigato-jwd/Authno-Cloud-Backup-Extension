@@ -39,7 +39,7 @@
  */
 
 import { UploadQueue } from './queue.js';
-import { startPolling, stopPolling, onProgress, recordUpload, pollNow } from './sync.js';
+import { startPolling, stopPolling, onProgress, recordUpload, readUploadBaseline, pollNow } from './sync.js';
 import { GDriveProvider } from './gdrive.js';
 import { WebDAVProvider } from './webdav.js';
 import { DropboxProvider } from './dropbox.js';
@@ -58,12 +58,18 @@ const REQUEST_POLL_MS = 400;
 
 export function activate(authno) {
   const { storage } = authno;
-  const queue = new UploadQueue(storage);
+  // The second argument is where a re-queued book gets its "last uploaded"
+  // time from, now that the queue entry carrying it does not outlive the
+  // upload. Same record the poll reads.
+  const queue = new UploadQueue(storage, (id) => readUploadBaseline(storage, id));
 
+  // Bound with storage as well as the host: a provider that renews a token
+  // part way through a long operation has to be able to write it down, and
+  // only the instance knows where. See BaseProvider.freshen.
   const PROVIDERS = {
-    gdrive: new GDriveProvider().bind(authno),
-    dropbox: new DropboxProvider().bind(authno),
-    webdav: new WebDAVProvider().bind(authno),
+    gdrive: new GDriveProvider().bind(authno, storage),
+    dropbox: new DropboxProvider().bind(authno, storage),
+    webdav: new WebDAVProvider().bind(authno, storage),
   };
 
   // Progress goes to storage so the settings page can read it. It is a
@@ -399,12 +405,18 @@ export function activate(authno) {
     'sync.status': () => OPERATIONS.getStatus(),
   };
 
-  const commandOffs = [];
-  for (const [name, fn] of Object.entries(COMMANDS)) {
+  // The promises, not the results. `activate()` returns its deactivate
+  // function synchronously while these four round trips are still in flight,
+  // so a deactivate that lands first — disabling an extension straight after
+  // enabling it, or the update path, which stops the old copy before
+  // rewriting its files — found an empty array and unregistered nothing. The
+  // handlers stayed attached to commands whose extension had gone.
+  const commandRegistrations = Object.entries(COMMANDS).map(([name, fn]) =>
     authno.commands.register(name, (args) => fn(args ?? {}))
-      .then((off) => commandOffs.push(off))
-      .catch((e) => console.error(`[cloud-backup] could not register ${name}:`, e.message));
-  }
+      .catch((e) => {
+        console.error(`[cloud-backup] could not register ${name}:`, e.message);
+        return null;
+      }));
 
   return async function deactivate() {
     // Order matters. Stop producing work first, then stop serving requests,
@@ -414,6 +426,8 @@ export function activate(authno) {
     clearInterval(requestTimer);
     unregChange();
     unregAutosave();
-    for (const off of commandOffs) { try { off(); } catch { /* going regardless */ } }
+    for (const off of await Promise.all(commandRegistrations)) {
+      if (typeof off === 'function') { try { off(); } catch { /* going regardless */ } }
+    }
   };
 }

@@ -12,7 +12,7 @@
  */
 
 export class BaseProvider {
-  constructor(id) { this.id = id; this._authno = null; }
+  constructor(id) { this.id = id; this._authno = null; this._storage = null; }
 
   /**
    * Hand this provider the host API, once, at activate().
@@ -29,7 +29,7 @@ export class BaseProvider {
    * token that expires halfway through a sixty-book poll has to renew without
    * every call site having remembered to pass a context down.
    */
-  bind(authno) { this._authno = authno; return this; }
+  bind(authno, storage = null) { this._authno = authno; this._storage = storage; return this; }
 
   get name() { throw new Error('not implemented'); }
   get icon() { return 'Cloud'; }
@@ -66,9 +66,33 @@ export class BaseProvider {
   async refreshCreds(storage) {
     const raw = await this.loadCreds(storage);
     if (!raw) return null;
-    const fresh = await this._refreshIfNeeded(raw);
-    // If the token was updated, save it back to storage immediately
-    if (fresh !== raw) await this.saveCreds(storage, fresh);
+    return this.freshen(raw, storage);
+  }
+
+  /**
+   * Renew if due, and write the result down.
+   *
+   * The paragraph at the top of this file describes what happens without the
+   * writing-down half, and every provider method was doing exactly that:
+   * calling `_refreshIfNeeded` directly and throwing away what came back. Ten
+   * sites across Drive and Dropbox.
+   *
+   * In the common case it cost nothing, because index.js refreshes on the way
+   * in and the token is still good. It bites on a long operation — the
+   * sixty-book poll the comment above already names — where the token expires
+   * part way through: that renewal was used for one request and dropped, so
+   * the next call reloaded the stale credentials and renewed again. On Dropbox,
+   * which rotates the refresh token on every use, "renew again" eventually
+   * means presenting one Dropbox has already retired, and backups stop with an
+   * authentication error nobody can explain.
+   *
+   * `storage` is optional because the provider is given one at bind() time;
+   * the argument is for `refreshCreds`, which already has it in hand.
+   */
+  async freshen(creds, storage = this._storage) {
+    if (!creds) return creds;
+    const fresh = await this._refreshIfNeeded(creds);
+    if (fresh !== creds && storage) await this.saveCreds(storage, fresh);
     return fresh;
   }
 }

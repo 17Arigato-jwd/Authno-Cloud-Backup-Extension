@@ -2,7 +2,7 @@
   "apiVersion": 2,
   "id": "cloud-backup",
   "name": "Cloud Backup",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Keeps a copy of your books on a service you already use.",
   "author": "Aurora Studios",
   "icon": "Cloud",

@@ -145,6 +145,18 @@ async function _poll({ authno, storage, providers, getActiveCreds, onImport, onC
   emit({ phase: 'done', current: total, total });
 }
 
+/**
+ * The last time this session uploaded, or null.
+ *
+ * Written by `recordUpload` below and read by the poll a few lines up. The
+ * upload path needs it too — see UploadQueue.enqueue — because the queue entry
+ * that used to carry it does not survive the upload that sets it.
+ */
+export async function readUploadBaseline(storage, sessionId) {
+  const state = (await storage.getJSON(`${SYNC_KEY}:${sessionId}`, {})) ?? {};
+  return state.lastUploadedAt ?? null;
+}
+
 /** Record a successful upload for a session so polling knows the baseline. */
 export async function recordUpload(storage, sessionId) {
   const state = (await storage.getJSON(`${SYNC_KEY}:${sessionId}`, {})) ?? {};
