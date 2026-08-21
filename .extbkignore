@@ -1,0 +1,8 @@
+# Tests are for whoever works on this, not for the people who install it.
+# Without this they are packed into the extension and shipped — `extbk info`
+# on 2.0.0 listed test/run.mjs among the modules.
+test/
+
+# Development notes and CI config are not extension content either. The
+# packer already skips dotfiles, so .github is covered; this is for anything
+# added later that is not hidden.

@@ -2,6 +2,30 @@
 
 All notable, user-facing changes.
 
+## 2.0.1
+
+_Four things that made a copy less reliable than it looked._
+
+- **A book that failed to upload is no longer forgotten.** After five failed
+  attempts the book was dropped from the queue entirely, and the status went
+  back to saying everything was copied. It now stays on the list, says so, and
+  is tried again the next time AuthNo starts.
+- **Editing a book you have already copied no longer looks like a clash.**
+  The record of when a book last went up did not survive the upload that made
+  it, so the next copy of the same book compared against nothing and reported
+  that both sides had changed. Answering "keep the stored one" at that point
+  would have replaced newer writing with the copy this extension had just made.
+- **A clash stays on the list until you deal with it.** It was removed as soon
+  as the question was asked, so dismissing the question left no trace that
+  anything needed attention.
+- **A long copy no longer ends in a sign-in error.** When a session expired
+  part way through copying many books, the renewed sign-in was used once and
+  then thrown away — and with providers that retire the old one each time, the
+  next attempt presented one that no longer worked.
+
+Removing the extension, disabling it, or updating it now always detaches its
+commands; a fast enough disable used to leave them attached.
+
 ## 2.0.0
 
 _Rewritten against AuthNo's second extension API. It asks before it does

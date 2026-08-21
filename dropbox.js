@@ -105,7 +105,7 @@ export class DropboxProvider extends BaseProvider {
   }
 
   async upload(entry, creds, base64) {
-    creds = await this._refreshIfNeeded(creds);
+    creds = await this.freshen(creds);
     // Use readable filename: {SafeTitle}_{sessionId}.authbook
     const path   = this._remotePath(entry.sessionId, entry.title);
     const apiArg = { path, mode: 'overwrite', autorename: false };
@@ -167,7 +167,7 @@ export class DropboxProvider extends BaseProvider {
   }
 
   async getFileMeta(sessionId, creds) {
-    creds = await this._refreshIfNeeded(creds);
+    creds = await this.freshen(creds);
     const path = this._remotePath(sessionId);
     try {
       const res = await fetch('https://api.dropboxapi.com/2/files/get_metadata', {
@@ -189,7 +189,7 @@ export class DropboxProvider extends BaseProvider {
   }
 
   async listFiles(creds) {
-    creds = await this._refreshIfNeeded(creds);
+    creds = await this.freshen(creds);
     console.log(`[Dropbox] LIST_FOLDER — path: ${DROPBOX_REMOTE_ROOT}`);
 
     const res = await fetch('https://api.dropboxapi.com/2/files/list_folder', {
@@ -246,7 +246,7 @@ export class DropboxProvider extends BaseProvider {
   }
 
   async download(sessionId, creds) {
-    creds = await this._refreshIfNeeded(creds);
+    creds = await this.freshen(creds);
     // sessionId may actually be a full dropboxPath if passed from listFiles result
     const path = sessionId.startsWith('/') ? sessionId : this._remotePath(sessionId);
     console.log(`[Dropbox] DOWNLOAD starting — path: ${path}`);
@@ -286,7 +286,7 @@ export class DropboxProvider extends BaseProvider {
    * caller choose an arbitrary filename under the AuthNo root folder.
    */
   async uploadRaw(filename, base64, creds) {
-    creds = await this._refreshIfNeeded(creds);
+    creds = await this.freshen(creds);
     const path   = `/AuthNo/${filename}`;
     const apiArg = { path, mode: 'overwrite', autorename: false, mute: true };
     const bytes  = Uint8Array.from(atob(base64), c => c.charCodeAt(0));

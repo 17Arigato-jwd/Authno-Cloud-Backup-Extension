@@ -163,7 +163,7 @@ export class GDriveProvider extends BaseProvider {
   // ── Upload ────────────────────────────────────────────────────────────────
 
   async upload(entry, creds, base64) {
-    creds = await this._refreshIfNeeded(creds);
+    creds = await this.freshen(creds);
     const folderId = await this._getOrCreateFolder(creds);
     const existing = await this._findFile(entry.sessionId, folderId, creds);
 
@@ -218,7 +218,7 @@ export class GDriveProvider extends BaseProvider {
   // ── Metadata ──────────────────────────────────────────────────────────────
 
   async getFileMeta(sessionId, creds) {
-    creds = await this._refreshIfNeeded(creds);
+    creds = await this.freshen(creds);
     try {
       const folderId = await this._getOrCreateFolder(creds);
       const file     = await this._findFile(sessionId, folderId, creds);
@@ -230,7 +230,7 @@ export class GDriveProvider extends BaseProvider {
   // ── List ──────────────────────────────────────────────────────────────────
 
   async listFiles(creds) {
-    creds = await this._refreshIfNeeded(creds);
+    creds = await this.freshen(creds);
     const folderId = await this._getOrCreateFolder(creds);
     const res = await fetch(
       `https://www.googleapis.com/drive/v3/files?q=` +
@@ -272,7 +272,7 @@ export class GDriveProvider extends BaseProvider {
   // ── Download ──────────────────────────────────────────────────────────────
 
   async download(sessionId, creds) {
-    creds = await this._refreshIfNeeded(creds);
+    creds = await this.freshen(creds);
     const folderId = await this._getOrCreateFolder(creds);
     const file     = await this._findFile(sessionId, folderId, creds);
     if (!file) throw new Error(`GDrive: file not found for session ${sessionId}`);
@@ -300,7 +300,7 @@ export class GDriveProvider extends BaseProvider {
    * which always targets the per-session .authbook path.
    */
   async uploadRaw(filename, base64, creds) {
-    creds = await this._refreshIfNeeded(creds);
+    creds = await this.freshen(creds);
     const folderId = await this._getOrCreateFolder(creds);
 
     // Check if a file with this name already exists in the folder

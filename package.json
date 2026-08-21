@@ -1,9 +1,11 @@
 {
   "name": "cloud-backup",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "private": true,
   "scripts": {
     "build": "extbk build .",
-    "dev": "extbk-sandbox ."
-  }
+    "dev": "extbk-sandbox .",
+    "test": "node test/run.mjs"
+  },
+  "type": "module"
 }
