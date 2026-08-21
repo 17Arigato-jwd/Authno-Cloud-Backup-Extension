@@ -27,57 +27,57 @@ import { API } from './pageApi.js';
 document.head.insertAdjacentHTML('beforeend', `<style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    font-size: 14px; color: #e4e4f0; background: transparent; min-height: 100vh; }
+    font-size: 14px; color: var(--text-1); background: transparent; min-height: 100vh; }
 
   .screen { padding: 20px 16px; max-width: 480px; margin: 0 auto; }
   h1 { font-size: 18px; font-weight: 700; margin-bottom: 4px; }
-  .sub { color: #6b6b80; font-size: 12px; margin-bottom: 20px; line-height: 1.5; }
+  .sub { color: var(--text-4); font-size: 12px; margin-bottom: 20px; line-height: 1.5; }
 
   .file-list { display: flex; flex-direction: column; gap: 8px; }
   .file-row {
     display: flex; align-items: center; gap: 12px;
-    padding: 12px 14px; background: #1f1f2a; border: 1px solid #2e2e3a;
+    padding: 12px 14px; background: var(--surface); border: 1px solid var(--border);
     border-radius: 10px; cursor: pointer; transition: background .15s, border-color .15s;
     -webkit-tap-highlight-color: transparent;
   }
-  .file-row:hover, .file-row:active { background: #2a2a38; border-color: #6366f144; }
+  .file-row:hover, .file-row:active { background: var(--surface-md); border-color: var(--accent-a33); }
   .file-icon { font-size: 22px; flex-shrink: 0; }
   .file-info { flex: 1; min-width: 0; }
   .file-name { font-size: 13px; font-weight: 600; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; }
-  .file-meta { font-size: 11px; color: #6b6b80; margin-top: 2px; }
+  .file-meta { font-size: 11px; color: var(--text-4); margin-top: 2px; }
   .badge-local { font-size: 10px; font-weight: 600; padding: 1px 6px;
-    background: #22c55e22; color: #4ade80; border-radius: 5px; }
+    background: var(--color-success-bg); color: var(--color-success); border-radius: 5px; }
   .badge-import { font-size: 10px; font-weight: 600; padding: 1px 6px;
-    background: #6366f122; color: #818cf8; border-radius: 5px; }
+    background: var(--accent-a18); color: var(--accent-light); border-radius: 5px; }
 
-  .empty { text-align: center; padding: 48px 24px; color: #6b6b80; font-size: 13px; }
-  .err { color: #ef4444; font-size: 12px; padding: 12px; background: #ef444418;
+  .empty { text-align: center; padding: 48px 24px; color: var(--text-4); font-size: 13px; }
+  .err { color: var(--color-danger); font-size: 12px; padding: 12px; background: var(--color-danger-bg);
     border-radius: 8px; margin-bottom: 12px; }
 
-  .loading { text-align: center; padding: 40px; color: #6b6b80; font-size: 13px; }
-  .spinner { display: inline-block; width: 20px; height: 20px; border: 2px solid #2e2e3a;
-    border-top-color: #6366f1; border-radius: 50%; animation: spin .8s linear infinite; margin-bottom: 8px; }
+  .loading { text-align: center; padding: 40px; color: var(--text-4); font-size: 13px; }
+  .spinner { display: inline-block; width: 20px; height: 20px; border: 2px solid var(--border);
+    border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; margin-bottom: 8px; }
   @keyframes spin { to { transform: rotate(360deg); } }
 
-  .sheet-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.6);
+  .sheet-overlay { position: fixed; inset: 0; background: var(--scrim-strong);
     display: flex; align-items: flex-end; z-index: 100; }
-  .sheet { background: #1a1a24; border-radius: 16px 16px 0 0; padding: 20px 20px 32px;
-    width: 100%; border-top: 1px solid #2e2e3a; }
+  .sheet { background: var(--surface); border-radius: 16px 16px 0 0; padding: 20px 20px 32px;
+    width: 100%; border-top: 1px solid var(--border); }
   .sheet h2 { font-size: 16px; font-weight: 700; margin-bottom: 4px; }
-  .sheet-sub { color: #6b6b80; font-size: 12px; margin-bottom: 20px; }
+  .sheet-sub { color: var(--text-4); font-size: 12px; margin-bottom: 20px; }
   .btn { display: flex; align-items: center; justify-content: center; gap: 6px;
     padding: 12px; border-radius: 10px; border: none; cursor: pointer;
     font-size: 14px; font-weight: 600; width: 100%; margin-bottom: 8px; }
-  .btn-primary { background: #6366f1; color: #fff; }
-  .btn-ghost { background: #1f1f2a; border: 1px solid #2e2e3a; color: #e4e4f0; }
+  .btn-primary { background: var(--accent); color: var(--on-accent, #fff); }
+  .btn-ghost { background: var(--surface); border: 1px solid var(--border); color: var(--text-1); }
   .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
   .back-btn { display: flex; align-items: center; gap: 6px; background: none; border: none;
-    color: #6b6b80; font-size: 13px; cursor: pointer; margin-bottom: 16px; padding: 0; }
+    color: var(--text-4); font-size: 13px; cursor: pointer; margin-bottom: 16px; padding: 0; }
 
   .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
-    background: #22c55e; color: #fff; font-size: 13px; font-weight: 600;
+    background: var(--color-success); color: var(--on-accent, #fff); font-size: 13px; font-weight: 600;
     padding: 10px 20px; border-radius: 20px; z-index: 200;
     animation: fadeUp .25s ease; }
   @keyframes fadeUp { from { opacity: 0; transform: translateX(-50%) translateY(8px); }
@@ -186,7 +186,7 @@ function renderConfirmSheet() {
       ${onDevice ? 'Update from cloud' : 'Import to library'}
     </button>
     <button class="btn btn-ghost" onclick="dismissSheet()">Cancel</button>
-    <div id="sheet-err" style="color:#ef4444;font-size:12px;margin-top:8px"></div>
+    <div id="sheet-err" style="color:var(--color-danger);font-size:12px;margin-top:8px"></div>
   </div>`;
   document.body.appendChild(sheet);
 }

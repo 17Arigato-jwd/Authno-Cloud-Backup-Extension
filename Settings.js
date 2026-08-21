@@ -69,88 +69,88 @@ document.head.insertAdjacentHTML('beforeend', `<style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { height: 100%; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    font-size: 14px; color: #e4e4f0; background: transparent; min-height: 100vh; }
+    font-size: 14px; color: var(--text-1); background: transparent; min-height: 100vh; }
 
   /* ── Shared top progress bar ──────────────────────────────────────────────── */
   .progress-bar-wrap {
     position: sticky; top: 0; z-index: 10; height: 3px;
-    background: #2e2e3a; overflow: hidden;
+    background: var(--border); overflow: hidden;
   }
   .progress-bar-fill {
-    height: 100%; background: #6366f1;
+    height: 100%; background: var(--accent);
     transition: width .4s ease, opacity .3s ease;
   }
   .progress-label {
-    font-size: 10px; color: #6b6b80; text-align: center;
-    padding: 3px 0; background: #0f0f18; letter-spacing: .03em;
+    font-size: 10px; color: var(--text-4); text-align: center;
+    padding: 3px 0; background: var(--surface-md); letter-spacing: .03em;
   }
 
   /* ── Provider picker ──────────────────────────────────────────────────────── */
   .login-screen { display: flex; flex-direction: column; align-items: center;
     justify-content: center; min-height: 100vh; padding: 32px 24px; }
   .login-title { font-size: 22px; font-weight: 700; margin-bottom: 6px; }
-  .login-sub { color: #9999aa; font-size: 13px; margin-bottom: 32px;
+  .login-sub { color: var(--text-3); font-size: 13px; margin-bottom: 32px;
     text-align: center; max-width: 300px; line-height: 1.5; }
-  .login-sub strong { color: #e4e4f0; }
-  .section-label { font-size: 12px; font-weight: 600; color: #9999aa;
+  .login-sub strong { color: var(--text-1); }
+  .section-label { font-size: 12px; font-weight: 600; color: var(--text-3);
     letter-spacing: .6px; text-transform: uppercase; margin-bottom: 14px;
     align-self: flex-start; max-width: 360px; width: 100%; }
   .pill-btn { display: flex; align-items: center; gap: 14px; width: 100%; max-width: 360px;
-    padding: 14px 20px; border-radius: 999px; border: 1.5px solid #3a3a4a;
-    background: #1c1c26; color: #e4e4f0; cursor: pointer; font-size: 15px; font-weight: 500;
+    padding: 14px 20px; border-radius: 999px; border: 1.5px solid var(--border);
+    background: var(--surface); color: var(--text-1); cursor: pointer; font-size: 15px; font-weight: 500;
     margin-bottom: 12px; transition: border-color .15s, background .15s, transform .1s;
     text-align: left; -webkit-tap-highlight-color: transparent; }
-  .pill-btn:hover  { border-color: #6366f1; background: #1f1f2e; }
+  .pill-btn:hover  { border-color: var(--accent); background: var(--surface-md); }
   .pill-btn:active { transform: scale(0.98); }
-  .pill-icon { width: 32px; height: 32px; border-radius: 50%; background: #111118;
+  .pill-icon { width: 32px; height: 32px; border-radius: 50%; background: var(--surface-md);
     display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
   .pill-label { flex: 1; }
-  .pill-chevron { color: #4a4a5a; font-size: 16px; }
+  .pill-chevron { color: var(--text-5); font-size: 16px; }
 
   /* ── Generic connected page (Dropbox / WebDAV) ────────────────────────────── */
   .page { padding: 16px; max-width: 480px; margin: 0 auto; }
   h1 { font-size: 18px; font-weight: 600; margin-bottom: 4px; }
-  .sub { color: #6b6b80; font-size: 13px; margin-bottom: 20px; line-height: 1.5; }
-  .card { background: #1f1f2a; border: 1px solid #2e2e3a; border-radius: 12px;
+  .sub { color: var(--text-4); font-size: 13px; margin-bottom: 20px; line-height: 1.5; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
     padding: 16px; margin-bottom: 12px; }
   .card h2 { font-size: 13px; font-weight: 600; margin-bottom: 12px; }
   .field { margin-bottom: 12px; }
-  .field label { display: block; font-size: 12px; color: #6b6b80; margin-bottom: 4px; }
-  .field input, .field select { width: 100%; background: #16161d; border: 1px solid #2e2e3a;
-    color: #e4e4f0; border-radius: 6px; padding: 8px 10px; font-size: 13px; }
+  .field label { display: block; font-size: 12px; color: var(--text-4); margin-bottom: 4px; }
+  .field input, .field select { width: 100%; background: var(--input-bg); border: 1px solid var(--border);
+    color: var(--text-1); border-radius: 6px; padding: 8px 10px; font-size: 13px; }
   .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px;
     padding: 9px 16px; border-radius: 8px; border: none; cursor: pointer;
     font-size: 13px; font-weight: 500; }
-  .btn-primary { background: #6366f1; color: #fff; }
-  .btn-ghost   { background: #1f1f2a; border: 1px solid #2e2e3a; color: #e4e4f0; }
-  .btn-danger  { background: #ef444418; border: 1px solid #ef444430; color: #fca5a5; }
+  .btn-primary { background: var(--accent); color: var(--on-accent, #fff); }
+  .btn-ghost   { background: var(--surface); border: 1px solid var(--border); color: var(--text-1); }
+  .btn-danger  { background: var(--color-danger-bg); border: 1px solid var(--ds-danger-line); color: var(--color-danger); }
   .btn:disabled { opacity: .5; cursor: not-allowed; }
   .btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
   .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
-  .dot-synced  { background: #22c55e; }
-  .dot-syncing { background: #eab308; animation: pulse 1s ease-in-out infinite; }
-  .dot-error   { background: #ef4444; }
+  .dot-synced  { background: var(--color-success); }
+  .dot-syncing { background: var(--color-warning); animation: pulse 1s ease-in-out infinite; }
+  .dot-error   { background: var(--color-danger); }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
-  .err-banner { color: #ef4444; font-size: 12px; margin-top: 10px; padding: 8px 12px;
-    background: #ef444418; border-radius: 6px; border: 1px solid #ef444430; }
+  .err-banner { color: var(--color-danger); font-size: 12px; margin-top: 10px; padding: 8px 12px;
+    background: var(--color-danger-bg); border-radius: 6px; border: 1px solid var(--ds-danger-line); }
   .hidden { display: none !important; }
   .toggle-row { display: flex; align-items: center; justify-content: space-between;
-    padding: 8px 0; border-bottom: 1px solid #2e2e3a; }
+    padding: 8px 0; border-bottom: 1px solid var(--border); }
   .toggle-row:last-child { border-bottom: none; }
   .toggle-label { font-size: 13px; }
-  .toggle-sub { font-size: 11px; color: #6b6b80; margin-top: 1px; }
+  .toggle-sub { font-size: 11px; color: var(--text-4); margin-top: 1px; }
   .toggle { position: relative; width: 38px; height: 22px; flex-shrink: 0; }
   .toggle input { opacity: 0; width: 0; height: 0; }
-  .toggle-slider { position: absolute; inset: 0; background: #2e2e3a; border-radius: 11px;
+  .toggle-slider { position: absolute; inset: 0; background: var(--border); border-radius: 11px;
     transition: background .2s; }
-  .toggle input:checked + .toggle-slider { background: #6366f1; }
+  .toggle input:checked + .toggle-slider { background: var(--accent); }
   .toggle-slider::after { content: ''; position: absolute; width: 16px; height: 16px;
-    background: #fff; border-radius: 50%; top: 3px; left: 3px; transition: transform .2s; }
+    background: var(--on-accent, #fff); border-radius: 50%; top: 3px; left: 3px; transition: transform .2s; }
   .toggle input:checked + .toggle-slider::after { transform: translateX(16px); }
   .queue-row { display: flex; justify-content: space-between; align-items: center;
-    padding: 8px 0; border-bottom: 1px solid #2e2e3a; font-size: 12px; }
+    padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
   .queue-row:last-child { border-bottom: none; }
-  .error-msg { color: #ef4444; font-size: 11px; margin-top: 2px; }
+  .error-msg { color: var(--color-danger); font-size: 11px; margin-top: 2px; }
 
   /* ══════════════════════════════════════════════════════════════════════════
      GOOGLE DRIVE BESPOKE UI
@@ -158,10 +158,10 @@ document.head.insertAdjacentHTML('beforeend', `<style>
 
   /* Shared frosted-glass tile */
   .gd-tile {
-    background: rgba(36, 36, 50, 0.60);
+    background: var(--glass-bg);
     backdrop-filter: blur(18px);
     -webkit-backdrop-filter: blur(18px);
-    border: 1px solid rgba(255, 255, 255, 0.07);
+    border: 1px solid var(--glass-border);
     border-radius: 14px;
   }
 
@@ -187,24 +187,24 @@ document.head.insertAdjacentHTML('beforeend', `<style>
     align-items: center;
     gap: 10px;
   }
-  .gd-provider-name { font-size: 14px; font-weight: 600; color: #f0f0ff; }
-  .gd-provider-sub  { font-size: 11px; color: #8080a0; margin-top: 2px; }
+  .gd-provider-name { font-size: 14px; font-weight: 600; color: var(--text-1); }
+  .gd-provider-sub  { font-size: 11px; color: var(--text-3); margin-top: 2px; }
 
   /* Gradient circle: dark green at left → bright green at right */
   .gd-status-circle {
     width: 22px; height: 22px; border-radius: 50%; flex-shrink: 0;
-    background: radial-gradient(circle at 28% 50%, #14532d 0%, #4ade80 100%);
-    box-shadow: 0 0 10px rgba(74, 222, 128, 0.28);
+    background: radial-gradient(circle at 28% 50%, var(--color-success-bg) 0%, var(--color-success) 100%);
+    box-shadow: 0 0 10px var(--color-success-bg);
   }
   .gd-status-circle.syncing {
-    background: conic-gradient(#14532d 0%, #4ade80 40%, #fbbf24 70%, #78350f 100%);
-    box-shadow: 0 0 10px rgba(251, 191, 36, 0.28);
+    background: conic-gradient(var(--color-success-bg) 0%, var(--color-success) 40%, var(--color-warning) 70%, var(--color-warning-bg) 100%);
+    box-shadow: 0 0 10px var(--color-warning-bg);
     animation: gdSpin 1.1s linear infinite;
   }
   @keyframes gdSpin { to { transform: rotate(360deg); } }
   .gd-status-circle.error {
-    background: radial-gradient(circle at 28% 50%, #7f1d1d 0%, #f87171 100%);
-    box-shadow: 0 0 10px rgba(248, 113, 113, 0.28);
+    background: radial-gradient(circle at 28% 50%, var(--color-danger-bg) 0%, var(--color-danger) 100%);
+    box-shadow: 0 0 10px var(--color-danger-bg);
   }
 
   /* ② Book list */
@@ -217,31 +217,31 @@ document.head.insertAdjacentHTML('beforeend', `<style>
   }
   .gd-book-list::-webkit-scrollbar        { width: 3px; }
   .gd-book-list::-webkit-scrollbar-track  { background: transparent; }
-  .gd-book-list::-webkit-scrollbar-thumb  { background: rgba(255,255,255,.12); border-radius: 2px; }
+  .gd-book-list::-webkit-scrollbar-thumb  { background: var(--ds-tint); border-radius: 2px; }
 
   .gd-book-row {
     display: flex; align-items: center; gap: 10px;
     padding: 9px 0;
-    border-bottom: 1px solid rgba(255,255,255,0.05);
+    border-bottom: 1px solid var(--ds-tint-subtle);
   }
   .gd-book-row:last-child { border-bottom: none; }
   .gd-upload-icon { width: 20px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
-  .gd-book-title  { flex: 1; font-size: 13px; color: #ddddf0;
+  .gd-book-title  { flex: 1; font-size: 13px; color: var(--text-1);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .gd-no-books    { color: #555570; font-size: 12px; padding: 16px 0; text-align: center; }
+  .gd-no-books    { color: var(--text-5); font-size: 12px; padding: 16px 0; text-align: center; }
 
   /* Green iOS-style toggle */
   .gd-toggle { position: relative; width: 44px; height: 24px; flex-shrink: 0; cursor: pointer; }
   .gd-toggle input { opacity: 0; width: 0; height: 0; position: absolute; }
   .gd-toggle-slider {
     position: absolute; inset: 0; border-radius: 12px;
-    background: #2a2a3e; transition: background .2s; cursor: pointer;
+    background: var(--surface-md); transition: background .2s; cursor: pointer;
   }
-  .gd-toggle input:checked + .gd-toggle-slider { background: #16a34a; }
+  .gd-toggle input:checked + .gd-toggle-slider { background: var(--color-success); }
   .gd-toggle-slider::after {
     content: ''; position: absolute; width: 18px; height: 18px;
-    background: #fff; border-radius: 50%; top: 3px; left: 3px;
-    transition: transform .2s; box-shadow: 0 1px 4px rgba(0,0,0,.5);
+    background: var(--on-accent, #fff); border-radius: 50%; top: 3px; left: 3px;
+    transition: transform .2s; box-shadow: 0 1px 4px var(--scrim);
   }
   .gd-toggle input:checked + .gd-toggle-slider::after { transform: translateX(20px); }
 
@@ -251,23 +251,23 @@ document.head.insertAdjacentHTML('beforeend', `<style>
     display: flex; align-items: center; justify-content: space-between;
     margin-bottom: 10px;
   }
-  .gd-export-label { font-size: 13px; font-weight: 600; color: #ddddf0; }
+  .gd-export-label { font-size: 13px; font-weight: 600; color: var(--text-1); }
   .gd-export-btn {
     display: flex; align-items: center; gap: 5px;
-    background: #166534; color: #d1fae5;
-    border: 1px solid #15803d; border-radius: 20px;
+    background: var(--color-success); color: var(--on-success);
+    border: 1px solid var(--color-success); border-radius: 20px;
     padding: 5px 13px; font-size: 11px; font-weight: 700;
     letter-spacing: .06em; cursor: pointer; transition: background .15s;
     white-space: nowrap;
   }
-  .gd-export-btn:hover    { background: #14532d; }
+  .gd-export-btn:hover    { background: var(--color-success-bg); }
   .gd-export-btn:disabled { opacity: .5; cursor: not-allowed; }
 
   .gd-field { margin-bottom: 9px; }
-  .gd-field label { font-size: 11px; color: #7070a0; display: block; margin-bottom: 4px; }
+  .gd-field label { font-size: 11px; color: var(--text-4); display: block; margin-bottom: 4px; }
   .gd-field select,
   .gd-field input {
-    width: 100%; background: rgba(255,255,255,0.92); color: #111;
+    width: 100%; background: var(--text-1); color: var(--on-accent);
     border: none; border-radius: 7px; padding: 7px 10px; font-size: 13px;
     appearance: none; -webkit-appearance: none;
   }
@@ -281,8 +281,8 @@ document.head.insertAdjacentHTML('beforeend', `<style>
   /* ④ Amber import button */
   .gd-btn-import {
     width: 100%; padding: 12px 16px;
-    background: linear-gradient(90deg, #b45309, #f59e0b);
-    color: #fff; font-size: 14px; font-weight: 700;
+    background: linear-gradient(90deg, var(--color-warning), var(--color-warning));
+    color: var(--on-accent, #fff); font-size: 14px; font-weight: 700;
     border: none; border-radius: 12px; cursor: pointer;
     -webkit-tap-highlight-color: transparent;
     transition: filter .15s;
@@ -291,9 +291,9 @@ document.head.insertAdjacentHTML('beforeend', `<style>
 
   /* ⑤ Inline import file picker */
   .gd-import-panel {
-    border: 2px solid #d97706;
+    border: 2px solid var(--color-warning);
     border-radius: 14px;
-    background: #08080f;
+    background: var(--app-bg);
     min-height: 115px;
     max-height: 200px;
     overflow-y: auto;
@@ -307,37 +307,37 @@ document.head.insertAdjacentHTML('beforeend', `<style>
   .gd-import-placeholder {
     display: flex; align-items: center; justify-content: center;
     height: 80px;
-    color: rgba(255,255,255,0.11); font-size: 13px; font-weight: 600;
+    color: var(--text-5); font-size: 13px; font-weight: 600;
     transform: rotate(-14deg); pointer-events: none; user-select: none;
   }
   .gd-import-file {
     display: flex; align-items: center; gap: 10px;
-    padding: 9px 4px; border-bottom: 1px solid rgba(255,255,255,0.05);
+    padding: 9px 4px; border-bottom: 1px solid var(--ds-tint-subtle);
     cursor: pointer; border-radius: 6px; transition: background .1s;
     -webkit-tap-highlight-color: transparent;
   }
   .gd-import-file:last-child { border-bottom: none; }
-  .gd-import-file:hover  { background: rgba(255,255,255,0.04); }
+  .gd-import-file:hover  { background: var(--ds-tint-subtle); }
   .gd-import-fname {
-    flex: 1; font-size: 12px; color: #ddddf0;
+    flex: 1; font-size: 12px; color: var(--text-1);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .gd-badge-on-device {
     font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 5px;
-    background: rgba(34, 197, 94, 0.14); color: #4ade80; white-space: nowrap; flex-shrink: 0;
+    background: var(--color-success-bg); color: var(--color-success); white-space: nowrap; flex-shrink: 0;
   }
   .gd-badge-import {
     font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 5px;
-    background: rgba(99, 102, 241, 0.14); color: #818cf8; white-space: nowrap; flex-shrink: 0;
+    background: var(--accent-a18); color: var(--accent-light); white-space: nowrap; flex-shrink: 0;
   }
-  .gd-import-state { text-align: center; padding: 22px 0; font-size: 12px; color: #555570; }
-  .gd-import-error { color: #f87171; font-size: 12px; padding: 10px 0; }
+  .gd-import-state { text-align: center; padding: 22px 0; font-size: 12px; color: var(--text-5); }
+  .gd-import-error { color: var(--color-danger); font-size: 12px; padding: 10px 0; }
 
   /* ⑥ Bottom row */
   .gd-bottom-row { display: flex; gap: 8px; }
   .gd-btn-sync {
     flex: 1; padding: 11px 0;
-    background: #1d4ed8; color: #fff;
+    background: var(--color-info); color: var(--on-accent, #fff);
     border: none; border-radius: 12px;
     font-size: 13px; font-weight: 700; cursor: pointer;
     -webkit-tap-highlight-color: transparent;
@@ -347,7 +347,7 @@ document.head.insertAdjacentHTML('beforeend', `<style>
   .gd-btn-sync:disabled { opacity: .55; cursor: not-allowed; filter: none; }
   .gd-btn-disconnect {
     flex: 1; padding: 11px 0;
-    background: #b91c1c; color: #fff;
+    background: var(--color-danger); color: var(--on-accent, #fff);
     border: none; border-radius: 12px;
     font-size: 13px; font-weight: 700; cursor: pointer;
     -webkit-tap-highlight-color: transparent;
@@ -367,8 +367,8 @@ document.head.insertAdjacentHTML('beforeend', `<style>
     opacity: 1;
   }
   .gd-sync-progress-inner {
-    background: rgba(36, 36, 52, 0.70);
-    border: 1px solid rgba(255,255,255,0.07);
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-border);
     border-radius: 8px;
     height: 26px;
     margin-top: 2px;
@@ -377,14 +377,14 @@ document.head.insertAdjacentHTML('beforeend', `<style>
   }
   .gd-sync-bar {
     height: 100%; width: 0%;
-    background: linear-gradient(90deg, #1d4ed8, #6366f1, #818cf8);
+    background: linear-gradient(90deg, var(--color-info), var(--accent), var(--accent-light));
     border-radius: 8px;
     transition: width .4s ease;
   }
   .gd-sync-label {
     position: absolute; inset: 0;
     display: flex; align-items: center; justify-content: center;
-    font-size: 10px; font-weight: 600; color: rgba(255,255,255,0.65);
+    font-size: 10px; font-weight: 600; color: var(--text-3);
     letter-spacing: .04em; pointer-events: none;
   }
 
@@ -603,7 +603,7 @@ async function renderConnectedView() {
           <span>${p.svg ?? ''}</span>
           <div>
             <div style="font-weight:600">${p.label}</div>
-            <div style="font-size:12px;color:#6b6b80;margin-top:2px">
+            <div style="font-size:12px;color:var(--text-4);margin-top:2px">
               <span class="status-dot ${dotClass}"></span>
               ${tileStatus === 'synced'  ? 'All books backed up' :
                 tileStatus === 'syncing' ? 'Syncing…' : 'Sync error — tap Sync now to retry'}
@@ -627,7 +627,7 @@ async function renderConnectedView() {
             <div>${e.title}</div>
             ${e.errorMsg ? `<div class="error-msg">${e.errorMsg}</div>` : ''}
           </div>
-          <span style="color:#6b6b80;font-size:11px">${e.attempts}/5</span>
+          <span style="color:var(--text-4);font-size:11px">${e.attempts}/5</span>
         </div>`).join('')}
     </div>` : ''}
 
@@ -654,7 +654,7 @@ async function renderConnectedView() {
       <div id="book-toggles">Loading…</div>
     </div>
 
-    <p style="color:#6b6b80;font-size:11px;margin-top:8px">
+    <p style="color:var(--text-4);font-size:11px;margin-top:8px">
       Books back up automatically after every auto-save.
     </p>
   </div>`;
@@ -704,7 +704,7 @@ async function renderConnectedView() {
   const togglesEl = document.getElementById('book-toggles');
   if (togglesEl) {
     if (!sessions.length) {
-      togglesEl.innerHTML = '<div style="color:#6b6b80;font-size:12px">No books yet.</div>';
+      togglesEl.innerHTML = '<div style="color:var(--text-4);font-size:12px">No books yet.</div>';
     } else {
       const rows = await Promise.all(sessions.map(async s => {
         const disabled = await API.isBookBackupDisabled(s.id);
@@ -984,7 +984,7 @@ async function _gdLoadImportPanel(panel) {
         <span>📖</span>
         <span class="gd-import-fname">
           ${esc(displayName)}
-          ${dateTxt ? `<span style="color:#4a4a68;font-size:10px;margin-left:5px">${esc(dateTxt)}</span>` : ''}
+          ${dateTxt ? `<span style="color:var(--text-5);font-size:10px;margin-left:5px">${esc(dateTxt)}</span>` : ''}
         </span>
         <span class="${onDevice ? 'gd-badge-on-device' : 'gd-badge-import'}">
           ${onDevice ? '✓ On device' : 'Import'}
@@ -1029,7 +1029,7 @@ window.gdImportFile = async (sessionId, displayName) => {
     else if (activeProvider)         await renderConnectedView();
     else                             renderProviderPicker();
   } catch (e) {
-    document.body.innerHTML += `<div style="padding:24px;color:#ef4444;font-size:13px">
+    document.body.innerHTML += `<div style="padding:24px;color:var(--color-danger);font-size:13px">
       Failed to load: ${esc(e.message)}</div>`;
   }
 })();
